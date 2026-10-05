@@ -24,8 +24,8 @@ def make_android(path: Path):
         CREATE TABLE message (_id INTEGER PRIMARY KEY, chat_row_id INT, from_me INT, key_id TEXT,
             sender_jid_row_id INT, timestamp INT, message_type INT, text_data TEXT, starred INT);
         CREATE TABLE message_media (message_row_id INT, chat_row_id INT, file_path TEXT, mime_type TEXT, media_duration INT);
-        INSERT INTO jid VALUES (1,'447700900001@s.whatsapp.net'),(2,'120363000@g.us'),(3,'447700900002@s.whatsapp.net'),(4,'status@broadcast');
-        INSERT INTO chat VALUES (1,1,NULL,0,0),(2,2,'Family',0,1600000000000),(3,4,NULL,0,0);
+        INSERT INTO jid VALUES (1,'447700900001@s.whatsapp.net'),(2,'120363000@g.us'),(3,'447700900002@s.whatsapp.net'),(4,'status@broadcast'),(5,'447700900009@s.whatsapp.net');
+        INSERT INTO chat VALUES (1,1,NULL,0,0),(2,2,'Family',0,1600000000000),(3,4,NULL,0,0),(4,5,NULL,0,0);
         INSERT INTO message VALUES
             (1,1,0,'K1',0,1600000001000,0,'hi from bob',0),
             (2,1,1,'K2',0,1600000002000,0,'hi back',1),
@@ -50,7 +50,7 @@ def make_ios(path: Path):
                                         (4,'WAGroupMember',0,0),(5,'WAMediaItem',0,0);
         CREATE TABLE ZWACHATSESSION (Z_PK INTEGER PRIMARY KEY, Z_ENT INT, Z_OPT INT, ZCONTACTJID TEXT, ZPARTNERNAME TEXT,
             ZSESSIONTYPE INT, ZARCHIVED INT, ZMESSAGECOUNTER INT, ZUNREADCOUNT INT, ZGROUPINFO INT, ZLASTMESSAGE INT,
-            ZLASTMESSAGETEXT TEXT, ZLASTMESSAGEDATE REAL);
+            ZLASTMESSAGETEXT TEXT, ZLASTMESSAGEDATE REAL, ZHIDDEN INT, ZREMOVED INT);
         CREATE TABLE ZWAMESSAGE (Z_PK INTEGER PRIMARY KEY, Z_ENT INT, Z_OPT INT, ZCHATSESSION INT, ZGROUPMEMBER INT,
             ZISFROMME INT, ZMESSAGEDATE REAL, ZSENTDATE REAL, ZMESSAGETYPE INT, ZTEXT TEXT, ZSTANZAID TEXT,
             ZSTARRED INT, ZDATAITEMVERSION INT, ZMESSAGESTATUS INT, ZFROMJID TEXT, ZTOJID TEXT, ZSORT INT, ZMEDIAITEM INT);
@@ -177,12 +177,15 @@ def run(t: Path, password: str | None):
     assert i.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     bob = i.execute("SELECT ZTEXT, ZISFROMME, ZMESSAGETYPE, ZTOJID FROM ZWAMESSAGE WHERE ZCHATSESSION=1 ORDER BY ZSORT").fetchall()
     assert bob == [("hi from bob", 0, 0, None), ("hi back", 1, 0, BOB), (None, 0, 1, None),
-                   ("[Video: gone.mp4]", 0, 0, None), ("new on iphone", None, None, None)], bob
+                   ("[Video: gone.mp4]", 0, 0, None), ("new on iphone", 0, 0, None)], bob
     item = i.execute("SELECT mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZFILESIZE, mi.ZVCARDSTRING FROM ZWAMESSAGE m "
                      "JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM AND mi.ZMESSAGE = m.Z_PK").fetchone()
     assert item == (media[0][1][len("Message/"):], "look", len(PHOTO), "image/jpeg"), item
     grp = i.execute("SELECT ZPARTNERNAME, ZSESSIONTYPE, ZGROUPINFO FROM ZWACHATSESSION WHERE ZCONTACTJID=?", (GROUP,)).fetchone()
     assert grp[:2] == ("Family", 1) and grp[2], grp
+    # Visible in WhatsApp's chat list, and no empty chat for the contact with no messages.
+    assert i.execute("SELECT COUNT(*) FROM ZWACHATSESSION WHERE ZHIDDEN IS NOT 0 OR ZREMOVED IS NOT 0").fetchone()[0] == 0
+    assert i.execute("SELECT COUNT(*) FROM ZWACHATSESSION WHERE ZCONTACTJID = '447700900009@s.whatsapp.net'").fetchone()[0] == 0
     assert i.execute("SELECT g.ZMEMBERJID FROM ZWAMESSAGE m JOIN ZWAGROUPMEMBER g ON g.Z_PK=m.ZGROUPMEMBER").fetchall() == [(ALICE,)]
     for name, mx in i.execute("SELECT Z_NAME, Z_MAX FROM Z_PRIMARYKEY").fetchall():
         assert mx >= (i.execute(f"SELECT MAX(Z_PK) FROM Z{name.upper()}").fetchone()[0] or 0), name

@@ -141,6 +141,16 @@ def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dic
             continue
         is_group = chat_jid.endswith("@g.us")
 
+        rows = [m for m in a.execute(
+            """SELECT m.key_id, m.from_me, m.timestamp, m.message_type, m.text_data, m.starred,
+                      m.sender_jid_row_id, mm.*
+               FROM message m LEFT JOIN message_media mm ON mm.message_row_id = m._id
+               WHERE m.chat_row_id = ? ORDER BY m.timestamp, m._id""",
+            (chat["_id"],),
+        ) if m["timestamp"] and message_text(m["message_type"], m["text_data"], m["file_path"]) is not None]
+        if not rows:
+            continue  # contacts with no messages would show up as thousands of empty chats
+
         session = sessions.get(chat_jid)
         if session:
             stats["chats_merged"] += 1
@@ -165,17 +175,8 @@ def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dic
         members = known_members[session]
         existing_ids = known_ids[session]
 
-        rows = a.execute(
-            """SELECT m.key_id, m.from_me, m.timestamp, m.message_type, m.text_data, m.starred,
-                      m.sender_jid_row_id, mm.*
-               FROM message m LEFT JOIN message_media mm ON mm.message_row_id = m._id
-               WHERE m.chat_row_id = ? ORDER BY m.timestamp, m._id""",
-            (chat["_id"],),
-        )
         for m in rows:
             text = message_text(m["message_type"], m["text_data"], m["file_path"])
-            if text is None or not m["timestamp"]:
-                continue
             if m["key_id"] in existing_ids:
                 stats["skipped_dupes"] += 1
                 continue
@@ -232,11 +233,41 @@ def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dic
 
     console.print("  → Ordering messages...")
     _resort_chats(i, touched)
+    _repair(i)
     store.save_counters()
     i.commit()
     a.close()
     i.close()
     return stats
+
+
+# Columns WhatsApp always fills (Core Data defaults). Left NULL, WhatsApp's chat list filters the
+# chats out (e.g. "hidden == NO AND removed == NO"). Observed in a real iPhone ChatStorage.sqlite.
+ZERO_DEFAULTS = {
+    "ZWACHATSESSION": ["ZARCHIVED", "ZCONTACTABID", "ZFLAGS", "ZHIDDEN", "ZREMOVED", "ZIDENTITYVERIFICATIONEPOCH",
+                       "ZIDENTITYVERIFICATIONSTATE", "ZSPOTLIGHTSTATUS", "ZUNREADCOUNT", "ZMESSAGECOUNTER"],
+    "ZWAMESSAGE": ["ZCHILDMESSAGESDELIVEREDCOUNT", "ZCHILDMESSAGESPLAYEDCOUNT", "ZCHILDMESSAGESREADCOUNT", "ZDOCID",
+                   "ZENCRETRYCOUNT", "ZFILTEREDRECIPIENTCOUNT", "ZFLAGS", "ZGROUPEVENTTYPE", "ZMESSAGEERRORSTATUS",
+                   "ZSPOTLIGHTSTATUS", "ZSTARRED", "ZISFROMME", "ZMESSAGESTATUS", "ZMESSAGETYPE"],
+    "ZWAMEDIAITEM": ["ZMEDIAORIGIN", "ZASPECTRATIO", "ZHACCURACY", "ZLATITUDE", "ZLONGITUDE", "ZFILESIZE"],
+    "ZWAGROUPINFO": ["ZSTATE"],
+    "ZWAGROUPMEMBER": ["ZISACTIVE", "ZISADMIN"],
+}
+
+
+def _repair(i: sqlite3.Connection):
+    """Fills WhatsApp's always-set columns and removes empty imported chats. Also fixes earlier runs' output."""
+    empty = [(r[0],) for r in i.execute(
+        """SELECT Z_PK FROM ZWACHATSESSION s WHERE ZLASTMESSAGEDATE IS NULL
+           AND NOT EXISTS (SELECT 1 FROM ZWAMESSAGE m WHERE m.ZCHATSESSION = s.Z_PK)""")]
+    for table in ("ZWAGROUPMEMBER", "ZWAGROUPINFO"):
+        i.executemany(f"DELETE FROM {table} WHERE ZCHATSESSION = ?", empty)
+    i.executemany("DELETE FROM ZWACHATSESSION WHERE Z_PK = ?", empty)
+    for table, cols in ZERO_DEFAULTS.items():
+        existing = {r[1] for r in i.execute(f"PRAGMA table_info({table})")}
+        for col in cols:
+            if col in existing:
+                i.execute(f"UPDATE {table} SET {col} = 0 WHERE {col} IS NULL")
 
 
 def _resort_chats(i: sqlite3.Connection, sessions: set):

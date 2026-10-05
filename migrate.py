@@ -2,21 +2,20 @@
 """
 WhatsApp Android → iPhone Migration Tool
 -----------------------------------------
-Extracts WhatsApp data from Android via ADB, converts it,
-injects it into your iPhone backup, and guides you through restore.
+Pulls WhatsApp's backup from Android via ADB, decrypts it, merges the chats into
+the WhatsApp database inside a Finder backup of your iPhone, and guides the restore.
 
-Your iPhone is NEVER factory reset. If anything fails, your original
-backup is preserved and can be restored.
+Nothing on the Android phone is changed. The original backup files are saved aside
+with a rollback script before anything is edited.
 """
 import sys
-import shutil
+from datetime import datetime
 from pathlib import Path
 
 try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.prompt import Prompt, Confirm
-    from rich import print as rprint
 except ImportError:
     print("Missing dependencies. Run:  bash setup.sh")
     sys.exit(1)
@@ -29,7 +28,7 @@ OUTPUT_DIR = Path.home() / "WhatsApp-Migration"
 def banner():
     console.print(Panel.fit(
         "[bold white]WhatsApp Android → iPhone Migration[/bold white]\n"
-        "[dim]No factory reset. Your iPhone data is safe.[/dim]",
+        "[dim]No factory reset. Your Android phone is never modified.[/dim]",
         border_style="green",
     ))
     console.print()
@@ -37,8 +36,9 @@ def banner():
 
 def check_deps():
     import importlib
+    import shutil
     missing = []
-    for pkg in ["wa_crypt_tools", "rich", "Crypto"]:
+    for pkg in ["wa_crypt_tools", "rich"]:
         try:
             importlib.import_module(pkg)
         except ImportError:
@@ -47,182 +47,125 @@ def check_deps():
         console.print(f"[red]Missing packages:[/red] {', '.join(missing)}")
         console.print("Run:  [bold]bash setup.sh[/bold]")
         sys.exit(1)
+    if not shutil.which("adb"):
+        console.print("[red]adb not found.[/red] Run:  [bold]brew install android-platform-tools[/bold]")
+        sys.exit(1)
 
 
-def setup_dirs() -> dict:
-    dirs = {
-        "root":      OUTPUT_DIR,
-        "android":   OUTPUT_DIR / "android_data",
-        "decrypted": OUTPUT_DIR / "decrypted",
-        "ios":       OUTPUT_DIR / "ios_data",
-    }
-    for d in dirs.values():
-        d.mkdir(parents=True, exist_ok=True)
-    return dirs
+def step_android(dirs: dict) -> dict:
+    from src.android import ensure_device, pull_whatsapp_files, attempt_key_via_root
 
-
-def step_android_extraction(dirs: dict) -> dict:
-    from src.android import ensure_device, pull_whatsapp_files, attempt_key_via_adb_backup, attempt_key_via_run_as
-
-    console.print(Panel("[bold]STEP 1 — Extract data from Android[/bold]", style="blue"))
-
-    console.print("\nBefore continuing, make sure:")
-    console.print("  • Your Android phone is connected via USB")
-    console.print("  • USB Debugging is enabled")
-    console.print("    [dim](Settings → About Phone → tap Build Number 7 times → Developer Options → USB Debugging)[/dim]")
-    console.print("  • WhatsApp is installed and has at least one local backup")
-    console.print("    [dim](Open WhatsApp → Settings → Chats → Chat Backup → BACK UP NOW)[/dim]")
-    console.print()
-
-    if not Confirm.ask("Ready to connect Android?", default=True):
-        console.print("[yellow]Cancelled.[/yellow]")
+    console.print(Panel("[bold]STEP 1 — Get the backup from Android[/bold]", style="blue"))
+    console.print(
+        "\nOn the Android phone, set up a backup this tool can decrypt:\n"
+        "  1. WhatsApp → Settings → Chats → Chat backup → [bold]End-to-end encrypted backup[/bold] → Turn on\n"
+        "  2. Choose [bold]Use 64-digit encryption key instead[/bold] (a password will NOT work —\n"
+        "     WhatsApp keeps password-protected keys on its servers)\n"
+        "  3. [bold]Write the 64-digit key down[/bold], then tap BACK UP NOW and wait for it to finish\n"
+        "  4. Enable USB Debugging (Settings → About Phone → tap Build Number 7×,\n"
+        "     then Developer Options → USB Debugging) and connect the phone\n"
+        "[dim]Already using a password? Turn E2E backup off, then on again with the 64-digit key.[/dim]\n"
+    )
+    if not Confirm.ask("Done and phone connected?", default=True):
         sys.exit(0)
 
     ensure_device()
-
     pulled = pull_whatsapp_files(dirs["android"])
-
     if "backup_db" not in pulled:
-        console.print("\n[red]No WhatsApp backup database found on Android.[/red]")
-        console.print("Please open WhatsApp → Settings → Chats → Chat Backup → tap BACK UP NOW")
-        console.print("Then run this tool again.")
+        console.print("Open WhatsApp → Settings → Chats → Chat backup → BACK UP NOW, then run again.")
         sys.exit(1)
-
-    # Try to get decryption key
-    key_file = attempt_key_via_run_as(dirs["android"])
-    if not key_file:
-        key_file = attempt_key_via_adb_backup(dirs["android"])
-
-    if not key_file:
-        console.print("\n[yellow]Automatic key extraction did not work on your device.[/yellow]")
-        console.print("This is normal for most modern Android phones.")
-        console.print("\nYou have two options:\n")
-        console.print("  [bold]Option A[/bold] — Use WhatsApp E2E encrypted backup password/key")
-        console.print("    Open WhatsApp → Settings → Chats → Chat backup → End-to-end encrypted backup")
-        console.print("    Turn it ON with a password. Then enter that password here.\n")
-        console.print("  [bold]Option B[/bold] — Skip database (migrate media only)")
-        console.print("    Your photos/videos will be migrated but chat text history won't.\n")
-
-        choice = Prompt.ask("Enter your E2E backup password (or press Enter to skip)", default="")
-        if choice:
-            pulled["e2e_password"] = choice
-        else:
-            console.print("[yellow]Continuing with media-only migration.[/yellow]")
-            pulled["media_only"] = True
-    else:
-        pulled["key_file"] = key_file
-
+    pulled["key"] = attempt_key_via_root(dirs["android"])
     return pulled
 
 
-def step_decrypt(dirs: dict, pulled: dict) -> Path | None:
-    from src.decrypt import decrypt_backup, decrypt_with_password
+def step_decrypt(dirs: dict, pulled: dict) -> Path:
+    from src.decrypt import decrypt_backup, normalize_hex_key
 
-    if pulled.get("media_only"):
-        return None
-
-    console.print(Panel("[bold]STEP 2 — Decrypt WhatsApp database[/bold]", style="blue"))
-
-    crypt_file: Path = pulled["backup_db"]
-    key_file: Path | None = pulled.get("key_file")
-    password: str | None = pulled.get("e2e_password")
-
-    decrypted_db = None
-    if key_file:
-        decrypted_db = decrypt_backup(crypt_file, key_file, dirs["decrypted"])
-    elif password:
-        decrypted_db = decrypt_with_password(crypt_file, password, dirs["decrypted"])
-
-    if not decrypted_db:
-        console.print("[red]Could not decrypt the database.[/red]")
+    console.print(Panel("[bold]STEP 2 — Decrypt[/bold]", style="blue"))
+    key = pulled.get("key")
+    if key:
+        db = decrypt_backup(pulled["backup_db"], key, dirs["decrypted"])
+        if db:
+            return db
+    for _ in range(3):
+        key = normalize_hex_key(Prompt.ask("Enter the 64-digit backup key"))
+        if not key:
+            console.print("[yellow]That isn't 64 digits/letters (0-9, a-f). Try again.[/yellow]")
+            continue
+        db = decrypt_backup(pulled["backup_db"], key, dirs["decrypted"])
+        if db:
+            return db
         console.print(
-            "If you set up an E2E encrypted backup, make sure the password is correct.\n"
-            "Otherwise, proceed with media-only migration (your photos/videos will be migrated)."
+            "[yellow]Wrong key, or the backup on the phone was made before you set this key.[/yellow]\n"
+            "[dim]If so, tap BACK UP NOW on Android and restart this tool.[/dim]"
         )
-        if not Confirm.ask("Continue with media-only migration?", default=True):
-            sys.exit(0)
-        return None
-
-    return decrypted_db
+    console.print("[red]Could not decrypt. Nothing was changed anywhere.[/red]")
+    sys.exit(1)
 
 
-def step_convert(dirs: dict, android_db: Path) -> Path:
-    from src.convert import convert
+def step_iphone(dirs: dict, android_db: Path):
+    from src.iphone import choose_backup, check_backup, save_originals, extract_chatstorage, write_back, guide_restore
+    from src.convert import merge
 
-    console.print(Panel("[bold]STEP 3 — Convert to iOS format[/bold]", style="blue"))
-
-    ios_db = dirs["ios"] / "ChatStorage.sqlite"
-    convert(android_db, ios_db)
-    return ios_db
-
-
-def step_iphone_backup(dirs: dict, ios_db: Path | None, media_dir: Path | None):
-    from src.iphone import create_backup, inject_whatsapp_data, guide_restore, find_iphone_backup
-
-    console.print(Panel("[bold]STEP 4 — Backup & inject into iPhone[/bold]", style="blue"))
-
-    console.print("\nNow connect your iPhone via USB.")
-    console.print("Make sure you have [bold]trusted this Mac[/bold] on your iPhone.")
-    console.print("  [dim](A popup 'Trust This Computer?' should appear — tap Trust)[/dim]\n")
-
-    if not Confirm.ask("iPhone connected and trusted?", default=True):
-        console.print("[yellow]Cancelled.[/yellow]")
+    console.print(Panel("[bold]STEP 3 — Merge into your iPhone backup[/bold]", style="blue"))
+    console.print(
+        "\nOn the iPhone, WhatsApp must be installed and registered with the [bold]same number[/bold].\n"
+        "Then make a fresh local backup:\n"
+        "  1. Connect the iPhone, tap [bold]Trust[/bold] if asked\n"
+        "  2. Finder → select the iPhone → General → [bold]Back up all of the data on your iPhone to this Mac[/bold]\n"
+        "  3. Make sure [bold]Encrypt local backup[/bold] is unticked\n"
+        "  4. Click [bold]Back Up Now[/bold] and wait for it to finish\n"
+    )
+    if not Confirm.ask("Backup finished?", default=True):
         sys.exit(0)
 
-    # Create backup
-    backup_path = create_backup()
-    if not backup_path:
-        console.print("[red]Could not create iPhone backup. Make sure iPhone is connected and trusted.[/red]")
+    backup = choose_backup()
+    if not backup or not check_backup(backup):
         sys.exit(1)
 
-    if ios_db is None and media_dir is None:
-        console.print("[yellow]Nothing to inject — no database and no media available.[/yellow]")
-        sys.exit(1)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    rollback = save_originals(backup, dirs["root"] / "iphone_originals" / f"{backup.name}-{stamp}")
+    console.print(f"[green]  ✓ Original backup files saved.[/green] Undo script: {rollback}")
 
-    # Inject
-    success = inject_whatsapp_data(
-        backup_path,
-        ios_db,
-        media_dir,
+    db = extract_chatstorage(backup, dirs["ios"])
+    console.print("\n[bold]Merging chats...[/bold]")
+    stats = merge(android_db, db)
+
+    import sqlite3
+    with sqlite3.connect(db) as conn:
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            console.print("[red]Merged database failed its check. Backup NOT modified.[/red]")
+            sys.exit(1)
+
+    console.print(
+        f"[green]  ✓ {stats['messages']:,} messages imported[/green] "
+        f"({stats['chats_new']} new chats, {stats['chats_merged']} merged into existing, "
+        f"{stats['skipped_dupes']:,} already present)"
     )
-
-    if not success:
-        console.print("[red]Injection failed. Your iPhone backup is untouched (not restored).[/red]")
-        sys.exit(1)
-
-    # Guide restore
-    guide_restore(backup_path)
+    write_back(backup, db)
+    console.print("[green]  ✓ iPhone backup updated[/green]")
+    guide_restore(rollback)
 
 
 def main():
     banner()
     check_deps()
+    console.print(f"[dim]Working files are saved to: {OUTPUT_DIR}[/dim]\n")
 
-    console.print(f"[dim]All extracted data will be saved to: {OUTPUT_DIR}[/dim]\n")
+    dirs = {"root": OUTPUT_DIR, "android": OUTPUT_DIR / "android_data",
+            "decrypted": OUTPUT_DIR / "decrypted", "ios": OUTPUT_DIR / "ios_data"}
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
 
-    dirs = setup_dirs()
-
-    # Step 1: Android extraction
-    pulled = step_android_extraction(dirs)
-
-    media_dir = pulled.get("media_dir")
-
-    # Step 2: Decrypt
+    pulled = step_android(dirs)
     android_db = step_decrypt(dirs, pulled)
+    step_iphone(dirs, android_db)
 
-    # Step 3: Convert (only if we have the DB)
-    ios_db = None
-    if android_db:
-        ios_db = step_convert(dirs, android_db)
-    else:
-        console.print("\n[yellow]Skipping database conversion (no decrypted DB available).[/yellow]")
-
-    # Step 4: iPhone backup + inject + restore guide
-    step_iphone_backup(dirs, ios_db, media_dir)
-
-    console.print("\n[bold green]Migration complete![/bold green]")
-    console.print("Follow the restore instructions above, then check WhatsApp on your iPhone.")
-    console.print(f"\nAll files saved to: [bold]{OUTPUT_DIR}[/bold]")
+    if pulled.get("media_dir"):
+        console.print(
+            f"\nPhotos/videos/voice notes from Android are in: [bold]{pulled['media_dir']}[/bold]\n"
+            "In chats they appear as placeholders like [Photo: IMG-…jpg] so you can find each file."
+        )
 
 
 if __name__ == "__main__":

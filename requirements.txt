@@ -1,6 +1,2 @@
 rich>=13.0.0
-click>=8.0.0
 wa-crypt-tools>=0.1.0
-pymobiledevice3>=4.0.0
-pycryptodomex>=3.18.0
-protobuf>=4.0.0

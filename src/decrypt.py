@@ -1,84 +1,48 @@
 """
-Decrypts WhatsApp crypt12/14/15 backup files.
-Uses wa-crypt-tools under the hood.
+Decrypts WhatsApp crypt12/14/15 backup files with wa-crypt-tools.
 """
+import re
+import sqlite3
 import subprocess
 import sys
-import struct
 from pathlib import Path
 from rich.console import Console
 
 console = Console()
 
 
-def decrypt_backup(crypt_file: Path, key_file: Path, output_dir: Path) -> Path | None:
-    """
-    Decrypts a WhatsApp crypt12/14/15 file into a plain SQLite database.
-    Returns path to decrypted .db file, or None on failure.
-    Uses wa_crypt_tools.wadecrypt (the correct module name in v0.1.x).
-    """
-    out_db = output_dir / "msgstore.db"
-    suffix = crypt_file.suffix
-    console.print(f"\n[bold]Decrypting[/bold] {crypt_file.name} ({suffix})...")
+def normalize_hex_key(text: str) -> str | None:
+    """The 64-digit E2E key as shown by WhatsApp (spaces/dashes allowed) → hex string, else None."""
+    key = re.sub(r"[\s-]", "", text).lower()
+    return key if re.fullmatch(r"[0-9a-f]{64}", key) else None
 
-    # wa-crypt-tools v0.1.x entry point is wa_crypt_tools.wadecrypt
-    # Args: keyfile encrypted_file decrypted_file
+
+def decrypt_backup(crypt_file: Path, key: str | Path, output_dir: Path) -> Path | None:
+    """key is a key file path or a 64-digit hex key. Returns the decrypted msgstore.db or None."""
+    out_db = output_dir / "msgstore.db"
+    out_db.unlink(missing_ok=True)
+    console.print(f"\n[bold]Decrypting[/bold] {crypt_file.name}...")
+
     result = subprocess.run(
-        [
-            sys.executable, "-m", "wa_crypt_tools.wadecrypt",
-            str(key_file),
-            str(crypt_file),
-            str(out_db),
-        ],
+        [sys.executable, "-m", "wa_crypt_tools.wadecrypt", str(key), str(crypt_file), str(out_db)],
         capture_output=True,
         text=True,
     )
 
-    if result.returncode == 0 and out_db.exists() and out_db.stat().st_size > 0:
-        console.print("[green]  ✓ Decrypted successfully →[/green] msgstore.db")
-        return out_db
+    if result.returncode == 0 and out_db.exists():
+        try:
+            conn = sqlite3.connect(out_db)
+            ok = conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            count = conn.execute("SELECT COUNT(*) FROM message").fetchone()[0]
+            conn.close()
+        except sqlite3.Error as e:
+            ok, count = False, str(e)
+        if ok:
+            console.print(f"[green]  ✓ Decrypted — {count:,} messages found[/green]")
+            return out_db
+        console.print(f"[red]  ✗ Decrypted file is not a usable WhatsApp database ({count}).[/red]")
+        return None
 
-    err = (result.stderr or result.stdout or "").strip()
-    console.print(f"[red]  ✗ Decryption failed:[/red] {err}")
+    err = (result.stderr or result.stdout or "").strip().splitlines()
+    console.print(f"[red]  ✗ Decryption failed:[/red] {err[-1] if err else 'unknown error'}")
     return None
-
-
-def decrypt_with_password(crypt_file: Path, password: str, output_dir: Path) -> Path | None:
-    """
-    For E2E-encrypted backups set with a 64-digit key or password.
-    wa-crypt-tools accepts a hex string key as the first positional argument.
-    """
-    out_db = output_dir / "msgstore.db"
-    console.print("\n[bold]Decrypting with password/key...[/bold]")
-
-    # If password looks like a 64-char hex key, pass it directly.
-    # Otherwise pass via --password flag (supported in newer builds).
-    args = [sys.executable, "-m", "wa_crypt_tools.wadecrypt"]
-    if len(password.replace("-", "").replace(" ", "")) == 64:
-        args += [password.replace("-", "").replace(" ", ""), str(crypt_file), str(out_db)]
-    else:
-        args += ["--password", password, str(crypt_file), str(out_db)]
-
-    result = subprocess.run(args, capture_output=True, text=True)
-
-    if result.returncode == 0 and out_db.exists() and out_db.stat().st_size > 0:
-        console.print("[green]  ✓ Decrypted with password![/green]")
-        return out_db
-
-    err = (result.stderr or result.stdout or "").strip()
-    console.print(f"[red]  ✗ Password decryption failed:[/red] {err}")
-    return None
-
-
-def probe_crypt_version(crypt_file: Path) -> int:
-    """Returns the crypt version number (12, 14, 15) from the file header."""
-    try:
-        with open(crypt_file, "rb") as f:
-            header = f.read(32)
-        if b"crypt15" in header or header[0:3] == b"\x00\x00\x00":
-            return 15
-        if b"crypt14" in header:
-            return 14
-        return 12
-    except Exception:
-        return 15

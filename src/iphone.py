@@ -1,223 +1,166 @@
 """
-iPhone backup creation, WhatsApp data injection, and guided restore.
-Uses the iTunes/Finder backup format directly (no jailbreak needed).
+Edits WhatsApp's ChatStorage.sqlite inside a local (unencrypted) Finder backup of the iPhone.
+
+Only three files in the backup are touched (ChatStorage.sqlite, its -wal/-shm) plus
+Manifest.db. Originals of all four are copied aside first, with a rollback script.
 """
-import sqlite3
 import hashlib
-import shutil
 import plistlib
-import uuid
-import os
-import subprocess
-from pathlib import Path
+import shutil
+import sqlite3
 from datetime import datetime
+from pathlib import Path
 from rich.console import Console
-from rich.prompt import Confirm
+from rich.prompt import Prompt
 
 console = Console()
 
-WHATSAPP_BUNDLE = "net.whatsapp.WhatsApp"
-WHATSAPP_DOMAIN = f"AppDomain-{WHATSAPP_BUNDLE}"
-
-# Known relative paths inside iOS WhatsApp sandbox
-WA_DB_PATH = "Library/Application Support/ChatStorage.sqlite"
-WA_MEDIA_PATH = "Message/Media"
-
+WA_DOMAIN = "AppDomainGroup-group.net.whatsapp.WhatsApp.shared"
+CHATSTORAGE = "ChatStorage.sqlite"
 BACKUP_BASE = Path.home() / "Library" / "Application Support" / "MobileSync" / "Backup"
 
 
-def _sha1(domain: str, relative_path: str) -> str:
-    """Compute the filename key used in iTunes backup for a given domain+path."""
-    return hashlib.sha1(f"{domain}-{relative_path}".encode()).hexdigest()
+def file_id(rel_path: str) -> str:
+    return hashlib.sha1(f"{WA_DOMAIN}-{rel_path}".encode()).hexdigest()
 
 
-def find_iphone_backup() -> Path | None:
-    """Returns the most recent iPhone backup directory, or None."""
-    if not BACKUP_BASE.exists():
-        return None
-    backups = sorted(
-        [d for d in BACKUP_BASE.iterdir() if d.is_dir()],
-        key=lambda d: d.stat().st_mtime,
-        reverse=True,
-    )
-    return backups[0] if backups else None
+def blob_path(backup: Path, fid: str) -> Path:
+    return backup / fid[:2] / fid
 
 
-def create_backup() -> Path | None:
-    """
-    Triggers an iPhone backup via Finder/iTunes.
-    Returns path to the backup directory.
-    """
-    console.print("\n[bold]Creating iPhone backup...[/bold]")
-    console.print("  [dim]→ This may open Finder or iTunes on your Mac[/dim]")
-
-    before = set(BACKUP_BASE.glob("*")) if BACKUP_BASE.exists() else set()
-
-    # Use idevicebackup2 if available (libimobiledevice), else fall back to applescript
-    if shutil.which("idevicebackup2"):
-        console.print("  Using idevicebackup2...")
-        result = subprocess.run(
-            ["idevicebackup2", "backup", "--full", str(BACKUP_BASE)],
-            capture_output=False,
-        )
-        if result.returncode != 0:
-            console.print("[red]  ✗ idevicebackup2 failed.[/red]")
-            return None
-    else:
-        # AppleScript to trigger backup via Finder
-        script = """
-        tell application "Finder" to activate
-        do shell script "open 'itms-backup://'"
-        """
+def choose_backup() -> Path | None:
+    try:
+        backups = [d for d in BACKUP_BASE.iterdir() if (d / "Manifest.db").exists()]
+    except PermissionError:
         console.print(
-            "\n  [yellow]Automatic backup not available.[/yellow]\n"
-            "  Please back up your iPhone manually:\n"
-            "  1. Connect iPhone to this Mac\n"
-            "  2. Open Finder → select your iPhone → click [bold]Back Up Now[/bold]\n"
-            "  3. Wait for it to finish\n"
-            "  4. Press Enter here when done"
+            "[red]macOS blocked access to the backup folder.[/red]\n"
+            "System Settings → Privacy & Security → Full Disk Access → enable your Terminal app, then run again."
         )
-        input()
-
-    after = set(BACKUP_BASE.glob("*")) if BACKUP_BASE.exists() else set()
-    new_backups = after - before
-    if new_backups:
-        backup_path = list(new_backups)[0]
-    else:
-        backup_path = find_iphone_backup()
-
-    if not backup_path:
-        console.print("[red]  ✗ No backup found.[/red]")
+        return None
+    except FileNotFoundError:
+        backups = []
+    if not backups:
+        console.print("[red]No local iPhone backups found.[/red]")
         return None
 
-    console.print(f"[green]  ✓ Backup found:[/green] {backup_path.name}")
-    return backup_path
+    backups.sort(key=lambda d: (d / "Manifest.db").stat().st_mtime, reverse=True)
+    for n, d in enumerate(backups, 1):
+        info = {}
+        try:
+            info = plistlib.loads((d / "Info.plist").read_bytes())
+        except Exception:
+            pass
+        when = datetime.fromtimestamp((d / "Manifest.db").stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        console.print(f"  {n}. {info.get('Device Name', '?')} ({info.get('Product Type', '?')}) — {when}  [dim]{d.name}[/dim]")
+    pick = Prompt.ask("Which backup is your iPhone's NEW backup?", choices=[str(n) for n in range(1, len(backups) + 1)], default="1")
+    return backups[int(pick) - 1]
 
 
-def _read_manifest(backup_path: Path) -> sqlite3.Connection:
-    manifest_db = backup_path / "Manifest.db"
-    conn = sqlite3.connect(str(manifest_db))
-    return conn
-
-
-def inject_whatsapp_data(
-    backup_path: Path,
-    ios_db: Path,
-    media_dir: Path | None,
-) -> bool:
-    """
-    Injects the converted iOS WhatsApp database (and media) into the backup.
-    Modifies Manifest.db and copies the file into the backup directory.
-    Returns True on success.
-    """
-    console.print("\n[bold]Injecting WhatsApp data into backup...[/bold]")
-
-    manifest_db_path = backup_path / "Manifest.db"
-    if not manifest_db_path.exists():
-        console.print("[red]  ✗ Manifest.db not found. Is this a valid backup?[/red]")
-        return False
-
-    # Back up original Manifest.db before modifying
-    shutil.copy2(str(manifest_db_path), str(manifest_db_path.parent / "Manifest.db.bak"))
-    console.print("  [dim]→ Original Manifest.db backed up as Manifest.db.bak[/dim]")
-
-    conn = sqlite3.connect(str(manifest_db_path))
-
-    files_to_inject = [(WA_DB_PATH, ios_db)]
-
-    # Media files
-    injected_media = 0
-    if media_dir and media_dir.exists():
-        console.print("  → Including media files...")
-        for media_file in media_dir.rglob("*"):
-            if media_file.is_file():
-                rel = media_file.relative_to(media_dir)
-                wa_rel_path = f"{WA_MEDIA_PATH}/{rel}"
-                files_to_inject.append((wa_rel_path, media_file))
-                injected_media += 1
-        console.print(f"  [dim]→ {injected_media:,} media files queued[/dim]")
-
-    injected = 0
-    for rel_path, src_file in files_to_inject:
-        file_hash = _sha1(WHATSAPP_DOMAIN, rel_path)
-        file_size = src_file.stat().st_size
-
-        # Destination inside backup
-        dest_dir = backup_path / file_hash[:2]
-        dest_dir.mkdir(exist_ok=True)
-        dest_file = dest_dir / file_hash
-
-        shutil.copy2(str(src_file), str(dest_file))
-
-        # Upsert into Manifest.db
-        conn.execute(
-            """INSERT OR REPLACE INTO Files
-               (fileID, domain, relativePath, flags, file)
-               VALUES (?, ?, ?, 1, ?)""",
-            (
-                file_hash,
-                WHATSAPP_DOMAIN,
-                rel_path,
-                _make_file_plist(rel_path, file_size),
-            ),
+def check_backup(backup: Path) -> bool:
+    manifest = plistlib.loads((backup / "Manifest.plist").read_bytes())
+    if manifest.get("IsEncrypted"):
+        console.print(
+            "[red]This backup is encrypted, which this tool cannot edit.[/red]\n"
+            "In Finder, untick [bold]Encrypt local backup[/bold], click Back Up Now, then run again.\n"
+            "[dim](An unencrypted backup does not carry saved passwords, Health data or Wi-Fi networks — "
+            "those stay in iCloud Keychain/iCloud if you use it.)[/dim]"
         )
-        injected += 1
-
-    conn.commit()
-    conn.close()
-
-    console.print(f"[green]  ✓ Injected {injected:,} files into backup[/green]")
+        return False
+    with sqlite3.connect(backup / "Manifest.db") as conn:
+        found = conn.execute(
+            "SELECT COUNT(*) FROM Files WHERE domain = ? AND relativePath = ?", (WA_DOMAIN, CHATSTORAGE)
+        ).fetchone()[0]
+    if not found:
+        console.print(
+            "[red]WhatsApp's chat database is not in this backup.[/red]\n"
+            "Install WhatsApp on the iPhone, verify your number, open it once, then back up again."
+        )
+        return False
     return True
 
 
-def _make_file_plist(rel_path: str, size: int) -> bytes:
-    """Creates the minimal binary plist stored in Manifest.db Files.file column."""
-    now = datetime.utcnow()
-    data = {
-        "$version": 100000,
-        "$objects": [
-            "$null",
-            {
-                "$class": {"CF$UID": 2},
-                "Birth": 0,
-                "EncryptionKey": {"CF$UID": 0},
-                "FileID": "",
-                "Flags": 1,
-                "GroupID": 501,
-                "InodeNumber": 0,
-                "LastModified": now,
-                "LastStatusChange": now,
-                "Mode": 33188,
-                "ProtectionClass": 0,
-                "RelativePath": rel_path,
-                "Size": size,
-                "UserID": 501,
-            },
-            {"$classname": "MBFile", "$classes": ["MBFile", "NSObject"]},
-        ],
-        "$archiver": "NSKeyedArchiver",
-        "$top": {"root": {"CF$UID": 1}},
-    }
-    return plistlib.dumps(data, fmt=plistlib.FMT_BINARY)
+def save_originals(backup: Path, safe_dir: Path):
+    """Copies every file we will touch, and writes rollback.sh that puts them back."""
+    safe_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["#!/bin/bash", "# Puts the iPhone backup back exactly as it was before migration.", "set -e"]
+    for name in ("Manifest.db", "Manifest.db-wal", "Manifest.db-shm"):
+        src = backup / name
+        if src.exists():
+            shutil.copy2(src, safe_dir / name)
+            lines.append(f'cp "{safe_dir / name}" "{src}"')
+    for suffix in ("", "-wal", "-shm"):
+        fid = file_id(CHATSTORAGE + suffix)
+        src = blob_path(backup, fid)
+        if src.exists():
+            shutil.copy2(src, safe_dir / fid)
+            lines.append(f'cp "{safe_dir / fid}" "{src}"')
+    rollback = safe_dir / "rollback.sh"
+    rollback.write_text("\n".join(lines) + "\necho 'Backup restored to original.'\n")
+    rollback.chmod(0o755)
+    return rollback
 
 
-def guide_restore(backup_path: Path):
-    """Prints clear instructions for restoring the modified backup."""
+def extract_chatstorage(backup: Path, work_dir: Path) -> Path:
+    """Copies ChatStorage (+ its WAL) out and folds the WAL in, giving one self-contained file."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    db = work_dir / CHATSTORAGE
+    for suffix in ("", "-wal", "-shm"):
+        (work_dir / (CHATSTORAGE + suffix)).unlink(missing_ok=True)
+        src = blob_path(backup, file_id(CHATSTORAGE + suffix))
+        if src.exists() and suffix != "-shm":
+            shutil.copy2(src, work_dir / (CHATSTORAGE + suffix))
+    conn = sqlite3.connect(db)
+    if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        conn.close()
+        raise RuntimeError("The iPhone's WhatsApp database in this backup is damaged. Make a fresh backup.")
+    conn.execute("PRAGMA journal_mode=DELETE")  # merges -wal into the main file
+    conn.close()
+    return db
+
+
+def _set_size(blob: bytes, size: int) -> bytes:
+    plist = plistlib.loads(blob)
+    for obj in plist["$objects"]:
+        if isinstance(obj, dict) and "Size" in obj:
+            obj["Size"] = size
+            obj["LastModified"] = int(datetime.now().timestamp())
+            return plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)
+    raise RuntimeError("Unexpected Manifest.db file record format.")
+
+
+def write_back(backup: Path, new_db: Path):
+    """Replaces ChatStorage in the backup and empties its stale -wal/-shm, updating Manifest sizes."""
+    conn = sqlite3.connect(backup / "Manifest.db")
+    for suffix in ("", "-wal", "-shm"):
+        fid = file_id(CHATSTORAGE + suffix)
+        row = conn.execute("SELECT file FROM Files WHERE fileID = ?", (fid,)).fetchone()
+        if not row:
+            continue
+        dest = blob_path(backup, fid)
+        dest.parent.mkdir(exist_ok=True)
+        if suffix:
+            # An old WAL replayed over the new database would corrupt it — leave an empty one.
+            dest.write_bytes(b"")
+        else:
+            shutil.copyfile(new_db, dest)
+        conn.execute("UPDATE Files SET file = ? WHERE fileID = ?", (_set_size(row[0], dest.stat().st_size), fid))
+    conn.commit()
+    conn.close()
+
+
+def guide_restore(rollback: Path):
     console.print("\n" + "─" * 60)
-    console.print("[bold yellow]RESTORE INSTRUCTIONS[/bold yellow]")
+    console.print("[bold yellow]RESTORE THE BACKUP TO YOUR IPHONE[/bold yellow]")
     console.print("─" * 60)
     console.print(
-        "\nYour modified backup is ready at:\n"
-        f"  [bold]{backup_path}[/bold]\n\n"
-        "To restore it to your iPhone:\n\n"
-        "  1. Open [bold]Finder[/bold] on your Mac\n"
-        "  2. Select your iPhone in the sidebar\n"
-        "  3. Click [bold]Restore Backup...[/bold]\n"
-        "  4. Choose the backup listed above\n"
-        "  5. Click [bold]Restore[/bold]\n"
-        "  6. Wait — do NOT unplug the iPhone until it fully restarts\n\n"
-        "[yellow]⚠ If WhatsApp shows no chats after restore:[/yellow]\n"
-        "  • Open WhatsApp → it may prompt 'Restore chat history' → tap Restore\n"
-        "  • If still empty: restore from Manifest.db.bak (the original backup)\n"
+        "\n  1. On the iPhone: Settings → [your name] → Find My → turn [bold]Find My iPhone[/bold] OFF\n"
+        "  2. Finder → select the iPhone → [bold]Restore Backup…[/bold] → pick the backup you just chose\n"
+        "  3. Keep the cable plugged in until the iPhone restarts and finishes\n"
+        "  4. Open WhatsApp. If it asks you to verify your number, do it.\n"
+        "     If it offers to restore from iCloud, tap [bold]Skip[/bold] — iCloud would replace the imported chats.\n"
+        "  5. Turn Find My back on.\n\n"
+        "[bold]Keep WhatsApp on your Android phone untouched until you have checked your chats on the iPhone.[/bold]\n"
+        "Nothing on the Android phone was changed, so it remains your full copy.\n\n"
+        f"To undo the backup edit (before restoring):  [bold]bash \"{rollback}\"[/bold]"
     )
     console.print("─" * 60)

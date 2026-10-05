@@ -1,16 +1,9 @@
 # WhatsApp Android → iPhone Migration Tool
 
-Migrate your entire WhatsApp history — chats, groups, media — from Android to an already set-up iPhone. No factory reset required.
+Move your WhatsApp chat history from Android to an **already set-up iPhone**. No factory reset.
 
-> **Your iPhone is never wiped.** The tool works by injecting your WhatsApp data into an iTunes backup. If anything fails, your original backup is preserved and can be restored.
-
----
-
-## Why this exists
-
-The official WhatsApp migration (Move to iOS) only works during the iPhone's initial setup screen. If your iPhone is already set up, you're stuck — unless you pay $30–40 for a commercial tool.
-
-This is a free, open-source alternative that does the same thing.
+> **Nothing on your Android phone is changed** — it stays your full copy until you've checked the iPhone.
+> On the Mac, the original backup files are saved aside with a `rollback.sh` before anything is edited.
 
 ---
 
@@ -18,163 +11,81 @@ This is a free, open-source alternative that does the same thing.
 
 | Data | Migrated |
 |------|----------|
-| All chat messages (1-on-1 and groups) | ✅ |
-| Group chats & group names | ✅ |
-| Photos, videos, voice notes | ✅ |
-| Documents & files | ✅ |
+| Text messages (1-on-1 and groups), with timestamps and sender | ✅ |
+| Group chats, group names, group senders | ✅ |
 | Starred messages | ✅ |
-| Message timestamps | ✅ |
-| Call history | ❌ (WhatsApp does not include this in backups) |
+| Chats already on the iPhone | ✅ kept, Android history merged in |
+| Photos, videos, voice notes, documents | ⚠️ shown as placeholders like `[Photo: IMG-…jpg] caption`; the files are copied to your Mac |
+| System notices, deleted messages, status updates | ❌ skipped |
+
+Re-running is safe: messages already imported are skipped.
 
 ---
 
 ## Requirements
 
-| Requirement | Notes |
-|-------------|-------|
-| Mac (macOS 12+) | Windows support planned |
-| Python 3.10+ | `python3 --version` to check |
-| ADB (Android Debug Bridge) | `brew install android-platform-tools` |
-| Android phone | USB Debugging must be enabled |
-| iPhone | Must be trusted on your Mac |
-| iTunes or Finder | For creating the iPhone backup |
-
----
-
-## Installation
+- Mac, Python 3.10+, `adb` (`brew install android-platform-tools`)
+- Terminal has **Full Disk Access** (System Settings → Privacy & Security), so it can read Finder backups
+- WhatsApp installed and registered on the iPhone with the **same number**
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/whatsapp-android-to-iphone.git
-cd whatsapp-android-to-iphone
-
 bash setup.sh
-```
-
-That's it. `setup.sh` installs all Python dependencies automatically.
-
----
-
-## Usage
-
-### Before you start
-
-**On your Android phone:**
-1. Open WhatsApp → Settings → Chats → Chat Backup
-2. Tap **BACK UP NOW** and wait for it to finish
-3. Enable USB Debugging:
-   - Settings → About Phone → tap **Build Number** 7 times
-   - Settings → Developer Options → turn on **USB Debugging**
-
-**On your iPhone:**
-- Make sure you have connected it to this Mac at least once and tapped **Trust** on the popup
-
-### Run the tool
-
-```bash
 python3 migrate.py
 ```
 
-The tool guides you through every step interactively — just follow the prompts.
+---
 
-### What happens
+## Steps (the tool walks you through these)
 
-```
-STEP 1 — Extract data from Android
-  → Pulls WhatsApp backup database (.crypt15) from your phone
-  → Pulls all media files (photos, videos, voice notes)
-  → Attempts automatic decryption key extraction
+**1. Android — make a backup the tool can decrypt**
+1. WhatsApp → Settings → Chats → Chat backup → **End-to-end encrypted backup** → Turn on
+2. Pick **Use 64-digit encryption key instead** and write the key down.
+   A *password* won't work: WhatsApp keeps password-protected keys on its servers, so they can't be decrypted offline.
+3. Tap **BACK UP NOW** and wait.
+4. Enable USB Debugging and plug the phone in.
 
-STEP 2 — Decrypt the database
-  → Decrypts the backup using the extracted key
-  → If automatic key extraction fails: asks for your WhatsApp
-     E2E encrypted backup password (see Troubleshooting below)
+**2. Decrypt** — enter the 64-digit key. (Rooted phones are read automatically.)
 
-STEP 3 — Convert to iOS format
-  → Converts Android's SQLite schema → iOS WhatsApp schema
+**3. iPhone — make a local backup**
+1. Finder → your iPhone → *Back up all of the data on your iPhone to this Mac*
+2. Untick **Encrypt local backup**, click **Back Up Now**
+3. The tool merges the chats into WhatsApp's database inside that backup.
 
-STEP 4 — Backup & inject into iPhone
-  → Creates a full backup of your iPhone (your safety net)
-  → Injects the converted WhatsApp data into that backup
-  → Guides you through the restore in Finder
-```
-
-All extracted files are saved to `~/WhatsApp-Migration/` on your Mac.
+**4. Restore**
+1. Turn off **Find My iPhone**
+2. Finder → **Restore Backup…** → the backup you picked
+3. Open WhatsApp; verify your number if asked. If it offers an **iCloud** restore, tap **Skip** — that would replace the imported chats.
 
 ---
 
 ## Troubleshooting
 
-### "No Android device detected"
-- Make sure the USB cable is properly connected
-- Check that USB Debugging is ON in Developer Options
-- When the **"Allow USB debugging?"** popup appears on your phone, tap **Allow**
-- Try a different USB cable (some cables are charge-only)
-
-### "Automatic key extraction did not work"
-This is normal on Android 10 and newer. WhatsApp blocks key access on non-rooted devices.
-
-**Fix:** Set up an E2E encrypted backup in WhatsApp:
-1. WhatsApp → Settings → Chats → Chat backup
-2. Tap **End-to-end encrypted backup** → Turn On
-3. Choose a password you'll remember
-4. Wait for the encrypted backup to finish
-5. Run the tool again — enter that password when prompted
-
-### "WhatsApp shows no chats after restore"
-- Open WhatsApp on iPhone — it may show a **"Restore chat history"** prompt → tap Restore
-- If still empty: in Finder, restore the original backup (`Manifest.db.bak` was saved automatically)
-
-### "Injection failed"
-Your iPhone was not changed at all — the tool exits before restoring if injection fails. Check that:
-- The iPhone is trusted on this Mac
-- You have enough free space on your Mac for the backup
+- **No Android device detected**: tap *Allow* on the USB debugging popup; try another cable.
+- **Wrong key**: the backup on the phone must be made *after* you set the 64-digit key. Tap BACK UP NOW and rerun.
+- **Backup is encrypted**: untick *Encrypt local backup* in Finder and back up again. Unencrypted backups don't carry saved passwords, Health or Wi-Fi data (those come back from iCloud if you use it).
+- **WhatsApp database not in backup**: open WhatsApp on the iPhone once (registered), then back up again.
+- **Undo before restoring**: `bash ~/WhatsApp-Migration/iphone_originals/<backup>-<time>/rollback.sh`
 
 ---
 
 ## How it works
 
-```
-Android phone                    Your Mac                      iPhone
-─────────────                    ────────                      ──────
-WhatsApp backup   ──[ADB]──▶   Pull .crypt15 + media
-                               Decrypt database
-                               Convert schema
-                               Create iPhone backup  ◀──[USB]──  iPhone
-                               Inject WA data
-                               ──[Finder restore]──▶  iPhone gets
-                                                       WA data back
-```
-
-**Key technical details:**
-- WhatsApp Android stores backups as AES-GCM encrypted SQLite databases (`.crypt15` format)
-- Decryption uses [wa-crypt-tools](https://github.com/ElDavoo/wa-crypt-tools)
-- The Android schema (`msgstore.db`) and iOS schema (`ChatStorage.sqlite`) are completely different — this tool converts between them
-- iTunes backups store app data as SHA1-hashed files in `~/Library/Application Support/MobileSync/Backup/`
-- The tool injects WhatsApp's app domain (`AppDomain-net.whatsapp.WhatsApp`) into `Manifest.db` and copies the converted files
-
----
-
-## Project structure
+- Android backups (`msgstore.db.crypt15`) are decrypted with [wa-crypt-tools](https://github.com/ElDavoo/wa-crypt-tools) and validated.
+- The iPhone's own `ChatStorage.sqlite` (domain `AppDomainGroup-group.net.whatsapp.WhatsApp.shared`) is copied out of the Finder backup, and rows are inserted into its real Core Data schema — the same approach as [watoi](https://github.com/residentsummer/watoi).
+- The edited database is written back, `Manifest.db` sizes are updated, and the stale `-wal` is emptied so it can't be replayed over the new data.
 
 ```
-├── migrate.py          # Main interactive CLI — start here
-├── setup.sh            # One-time dependency installer
-├── requirements.txt
-└── src/
-    ├── android.py      # ADB extraction, key retrieval
-    ├── decrypt.py      # crypt12/14/15 decryption
-    ├── convert.py      # Android → iOS database schema conversion
-    └── iphone.py       # iTunes backup manipulation + restore guide
+src/android.py      ADB pull of backup + media (read-only)
+src/decrypt.py      crypt12/14/15 decryption, validated
+src/convert.py      merge Android chats into iOS ChatStorage.sqlite
+src/iphone.py       backup selection, safety copy, write-back, restore guide
+test_migration.py   end-to-end check on synthetic data (python3 test_migration.py)
 ```
-
----
 
 ## Limitations
 
-- **macOS only** for now (Windows/Linux support is planned — PRs welcome)
-- **Non-rooted Android** — automatic key extraction may fail on Android 10+, requiring the E2E backup password workaround
-- **No iCloud backup support** — the tool creates a local iTunes/Finder backup, not an iCloud one
-- WhatsApp may update its backup format or integrity checks at any time, which could break injection
+- macOS only. Media files are not placed inside WhatsApp on iOS (placeholders + files on Mac).
+- Tested on synthetic databases matching current schemas, not on every WhatsApp version; WhatsApp can change its formats at any time.
 
 ---
 
@@ -183,10 +94,8 @@ WhatsApp backup   ──[ADB]──▶   Pull .crypt15 + media
 PRs are welcome. Some areas that would make great contributions:
 
 - [ ] Windows support (replace Mac-specific backup path with Windows equivalent)
-- [ ] Google Drive key extraction (OAuth flow to retrieve backup key without root)
-- [ ] Better media path resolution (match media files to messages)
-- [ ] Progress bar improvements for very large media archives
-- [ ] Automated tests with sample crypt14/15 files
+- [ ] Real media import into iOS (copy files into `Message/Media` and link `ZWAMEDIAITEM`)
+- [ ] Encrypted iPhone backup support
 
 ---
 
@@ -205,4 +114,4 @@ MIT License — see [LICENSE](LICENSE) for details.
 ## Acknowledgements
 
 - [wa-crypt-tools](https://github.com/ElDavoo/wa-crypt-tools) by ElDavoo — WhatsApp crypt15 decryption
-- [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) by doronz88 — iOS device interaction
+- [watoi](https://github.com/residentsummer/watoi) by residentsummer — iOS ChatStorage import approach

@@ -40,7 +40,7 @@ python3 migrate.py
 **1. Android — make a backup the tool can decrypt**
 1. WhatsApp → Settings → Chats → Chat backup → **End-to-end encrypted backup** → Turn on
 2. Pick **Use 64-digit encryption key instead** and write the key down.
-   A *password* won't work: WhatsApp keeps password-protected keys on its servers, so they can't be decrypted offline.
+   A *password* or *passkey* won't work: WhatsApp keeps those keys on its servers / your Google account, so they can't be decrypted offline. Already using one? Turn E2E backup off, then on again with the 64-digit key — before registering WhatsApp on the iPhone.
 3. Tap **BACK UP NOW** and wait.
 4. Enable USB Debugging and plug the phone in.
 

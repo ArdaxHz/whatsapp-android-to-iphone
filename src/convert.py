@@ -11,6 +11,8 @@ Media: when the Android file was pulled, the message becomes a real iOS media me
 files to copy into the backup. Missing files fall back to a "[Photo: …] caption" text.
 """
 import mimetypes
+from collections import defaultdict
+from itertools import groupby
 import sqlite3
 import uuid
 from pathlib import Path
@@ -116,12 +118,24 @@ def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dic
             raise RuntimeError(f"iPhone ChatStorage.sqlite has no {need} entity — unexpected WhatsApp version.")
 
     jids, chats = _android_chats(a)
+    # Decrypted backups ship without indexes; without this each chat rescans every message (hours).
+    a.execute("CREATE INDEX IF NOT EXISTS migrate_message_chat ON message (chat_row_id, timestamp)")
     sessions = {jid: pk for pk, jid in i.execute("SELECT Z_PK, ZCONTACTJID FROM ZWACHATSESSION")}
+    # Read the iPhone side once — per-chat queries are quadratic on large histories.
+    known_ids = defaultdict(set)
+    for session, sid in i.execute("SELECT ZCHATSESSION, ZSTANZAID FROM ZWAMESSAGE WHERE ZSTANZAID IS NOT NULL"):
+        known_ids[session].add(sid)
+    known_members = defaultdict(dict)
+    for pk, session, jid in i.execute("SELECT Z_PK, ZCHATSESSION, ZMEMBERJID FROM ZWAGROUPMEMBER"):
+        known_members[session][jid] = pk
+    touched = set()
     stats = {"chats_new": 0, "chats_merged": 0, "messages": 0, "skipped_dupes": 0, "media": []}
     has_media_item = "WAMediaItem" in store.ents
 
     console.print(f"  → {len(chats)} Android chats")
-    for chat in chats:
+    for n, chat in enumerate(chats, 1):
+        if n % 500 == 0 or n == len(chats):
+            console.print(f"    {n:,}/{len(chats):,} chats, {stats['messages']:,} messages so far")
         chat_jid = jids.get(chat["jid_row_id"])
         if not chat_jid or chat_jid == "status@broadcast" or chat_jid.endswith("@broadcast"):
             continue
@@ -148,12 +162,8 @@ def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dic
                 })
                 i.execute("UPDATE ZWACHATSESSION SET ZGROUPINFO = ? WHERE Z_PK = ?", (info, session))
 
-        members = {}
-        if is_group:
-            members = {jid: pk for pk, jid in i.execute(
-                "SELECT Z_PK, ZMEMBERJID FROM ZWAGROUPMEMBER WHERE ZCHATSESSION = ?", (session,))}
-        existing_ids = {r[0] for r in i.execute(
-            "SELECT ZSTANZAID FROM ZWAMESSAGE WHERE ZCHATSESSION = ? AND ZSTANZAID IS NOT NULL", (session,))}
+        members = known_members[session]
+        existing_ids = known_ids[session]
 
         rows = a.execute(
             """SELECT m.key_id, m.from_me, m.timestamp, m.message_type, m.text_data, m.starred,
@@ -218,9 +228,10 @@ def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dic
                 stats["media"].append((src, "Message/" + local_path))
             existing_ids.add(m["key_id"])
             stats["messages"] += 1
+            touched.add(session)
 
-        _resort_chat(i, session)
-
+    console.print("  → Ordering messages...")
+    _resort_chats(i, touched)
     store.save_counters()
     i.commit()
     a.close()
@@ -228,15 +239,18 @@ def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dic
     return stats
 
 
-def _resort_chat(i: sqlite3.Connection, session: int):
-    """iOS orders a chat by ZSORT; renumber by date and point the chat at its newest message."""
-    pks = [r[0] for r in i.execute(
-        "SELECT Z_PK FROM ZWAMESSAGE WHERE ZCHATSESSION = ? ORDER BY ZMESSAGEDATE, Z_PK", (session,))]
-    i.executemany("UPDATE ZWAMESSAGE SET ZSORT = ? WHERE Z_PK = ?", list(enumerate(pks)))
-    if pks:
+def _resort_chats(i: sqlite3.Connection, sessions: set):
+    """iOS orders a chat by ZSORT; renumber by date and point each chat at its newest message. One table pass."""
+    cols = {r[1] for r in i.execute("PRAGMA table_info(ZWACHATSESSION)")}
+    rows = i.execute(
+        "SELECT ZCHATSESSION, Z_PK FROM ZWAMESSAGE ORDER BY ZCHATSESSION, ZMESSAGEDATE, Z_PK").fetchall()
+    for session, group in groupby(rows, key=lambda r: r[0]):
+        if session not in sessions:
+            continue
+        pks = [pk for _, pk in group]
+        i.executemany("UPDATE ZWAMESSAGE SET ZSORT = ? WHERE Z_PK = ?", list(enumerate(pks)))
         last, text, date = i.execute(
             "SELECT Z_PK, ZTEXT, ZMESSAGEDATE FROM ZWAMESSAGE WHERE Z_PK = ?", (pks[-1],)).fetchone()
-        cols = {r[1] for r in i.execute("PRAGMA table_info(ZWACHATSESSION)")}
         updates = {"ZMESSAGECOUNTER": len(pks), "ZLASTMESSAGE": last, "ZLASTMESSAGETEXT": text, "ZLASTMESSAGEDATE": date}
         updates = {k: v for k, v in updates.items() if k in cols}
         i.execute(

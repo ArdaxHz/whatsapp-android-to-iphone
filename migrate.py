@@ -59,12 +59,13 @@ def step_android(dirs: dict) -> dict:
     console.print(
         "\nOn the Android phone, set up a backup this tool can decrypt:\n"
         "  1. WhatsApp → Settings → Chats → Chat backup → [bold]End-to-end encrypted backup[/bold] → Turn on\n"
-        "  2. Choose [bold]Use 64-digit encryption key instead[/bold] (a password will NOT work —\n"
-        "     WhatsApp keeps password-protected keys on its servers)\n"
+        "  2. Choose [bold]Use 64-digit encryption key instead[/bold] (a password or passkey will NOT work —\n"
+        "     WhatsApp keeps those keys on its servers / your Google account, not on the phone)\n"
         "  3. [bold]Write the 64-digit key down[/bold], then tap BACK UP NOW and wait for it to finish\n"
         "  4. Enable USB Debugging (Settings → About Phone → tap Build Number 7×,\n"
         "     then Developer Options → USB Debugging) and connect the phone\n"
-        "[dim]Already using a password? Turn E2E backup off, then on again with the 64-digit key.[/dim]\n"
+        "[dim]Already using a password or passkey? Turn E2E backup off, then on again with the 64-digit key,\n"
+        "and do this BEFORE registering WhatsApp on the iPhone (that logs Android out).[/dim]\n"
     )
     if not Confirm.ask("Done and phone connected?", default=True):
         sys.exit(0)
@@ -158,6 +159,14 @@ def main():
             "decrypted": OUTPUT_DIR / "decrypted", "ios": OUTPUT_DIR / "ios_data"}
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
+
+    android_db = dirs["decrypted"] / "msgstore.db"
+    media_dir = dirs["android"] / "media"
+    if android_db.exists() and Confirm.ask(
+        "Android data from a previous run was found on this Mac. Reuse it (skips Android steps)?", default=True
+    ):
+        step_iphone(dirs, android_db, media_dir if media_dir.exists() else None)
+        return
 
     pulled = step_android(dirs)
     android_db = step_decrypt(dirs, pulled)

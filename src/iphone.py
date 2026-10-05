@@ -147,6 +147,7 @@ class Backup:
         else:
             shutil.copyfile(path / "Manifest.db", self.manifest)
         self.db = sqlite3.connect(self.manifest)
+        self.password = password
         self.added: list[str] = []
 
     def blob(self, fid: str) -> Path:
@@ -189,21 +190,21 @@ class Backup:
             obj["EncryptionKey"] = plistlib.UID(len(objs) - 1)
         return plistlib.dumps(rec, fmt=plistlib.FMT_BINARY)
 
-    def put_file(self, rel: str, src: Path, template_rel: str = CHATSTORAGE):
-        """Adds or replaces a file, modelled on an existing file record."""
+    def put_file(self, rel: str, src: Path, template_rel: str = CHATSTORAGE, root_dir: Path | None = None, db=None):
+        """Adds or replaces a file, modelled on an existing file record (optionally into another backup folder)."""
         fid = file_id(rel)
-        dest = self.blob(fid)
+        dest = (root_dir or self.path) / fid[:2] / fid
         dest.parent.mkdir(exist_ok=True)
         template = self.record(template_rel)
         root = template["$objects"][template["$top"]["root"].data]
         key = os.urandom(32) if self.encrypted and "EncryptionKey" in root else None
-        if not self.has(rel):
+        if root_dir is None and not self.has(rel):
             self.added.append(fid)
         if key:
             _encrypt_file(src, dest, key)
         else:
             shutil.copyfile(src, dest)
-        self.db.execute(
+        (db or self.db).execute(
             "INSERT OR REPLACE INTO Files (fileID, domain, relativePath, flags, file) VALUES (?, ?, ?, 1, ?)",
             (fid, WA_DOMAIN, rel, self._new_record(template, rel, src.stat().st_size, key)),
         )
@@ -227,14 +228,58 @@ class Backup:
             raise RuntimeError("No WhatsApp folders found in the backup.")
         return row[0]
 
+    def _write_manifest(self, plain: Path, dest: Path):
+        if self.encrypted:
+            dest.write_bytes(_cbc(self.manifest_key).encrypt(_pad(plain.read_bytes())))
+        else:
+            shutil.copyfile(plain, dest)
+
     def save(self):
         self.db.commit()
         self.db.close()
-        dest = self.path / "Manifest.db"
-        if self.encrypted:
-            dest.write_bytes(_cbc(self.manifest_key).encrypt(_pad(self.manifest.read_bytes())))
-        else:
-            shutil.copyfile(self.manifest, dest)
+        self._write_manifest(self.manifest, self.path / "Manifest.db")
+        self.db = sqlite3.connect(self.manifest)  # still readable for export_whatsapp_only
+
+    def export_whatsapp_only(self, dest_root: Path) -> Path:
+        """Builds a partial backup holding only WhatsApp's shared container (chats + media).
+
+        Restored with RemoveItemsNotRestored off, the phone overwrites just these files and
+        keeps every other app, setting and login. Media blobs are hard-linked, not copied.
+        """
+        dest = dest_root / self.path.name
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True)
+        for name in ("Info.plist", "Status.plist", "Manifest.plist"):
+            if (self.path / name).exists():
+                shutil.copy2(self.path / name, dest / name)
+
+        plain = self.work / "Manifest-whatsapp-only.db"
+        plain.unlink(missing_ok=True)
+        slim = sqlite3.connect(plain)
+        for (sql,) in self.db.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"):
+            slim.execute(sql)
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name = 'Properties'").fetchone():
+            slim.executemany("INSERT INTO Properties VALUES (?, ?)", self.db.execute("SELECT * FROM Properties"))
+        rows = self.db.execute("SELECT * FROM Files WHERE domain = ?", (WA_DOMAIN,)).fetchall()
+        slim.executemany(f"INSERT INTO Files VALUES ({','.join('?' * len(rows[0]))})", rows)
+        for fid, flags in self.db.execute("SELECT fileID, flags FROM Files WHERE domain = ?", (WA_DOMAIN,)):
+            src = self.blob(fid)
+            if flags != 1 or not src.exists():
+                continue
+            (dest / fid[:2]).mkdir(exist_ok=True)
+            try:
+                os.link(src, dest / fid[:2] / fid)
+            except OSError:
+                shutil.copyfile(src, dest / fid[:2] / fid)
+        # The phone's live WAL would otherwise be replayed over the new database.
+        empty = self.work / "empty"
+        empty.write_bytes(b"")
+        for suffix in ("-wal", "-shm"):
+            self.put_file(CHATSTORAGE + suffix, empty, root_dir=dest, db=slim)
+        slim.commit()
+        slim.close()
+        self._write_manifest(plain, dest / "Manifest.db")
+        return dest_root
 
 
 # --- user flow ----------------------------------------------------------------
@@ -370,3 +415,35 @@ def guide_restore(rollback: Path, encrypted: bool):
         f"To undo the backup edit (before restoring):  [bold]bash \"{rollback}\"[/bold]"
     )
     console.print("─" * 60)
+
+
+def restore_whatsapp_only(slim_root: Path, udid: str, password: str | None):
+    """Sends the WhatsApp-only backup to the connected iPhone. Nothing outside WhatsApp's chats/media is touched."""
+    import asyncio
+    from pymobiledevice3.lockdown import create_using_usbmux
+    from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
+
+    async def run():
+        lockdown = await create_using_usbmux(serial=udid)
+        async with Mobilebackup2Service(lockdown) as svc:
+            last = [-10]
+
+            def progress(pct):
+                if pct - last[0] >= 10:
+                    last[0] = pct
+                    console.print(f"    {pct:.0f}%")
+
+            await svc.restore(
+                backup_directory=str(slim_root),
+                system=False,        # no system files
+                reboot=True,         # WhatsApp picks up the new data after restart
+                copy=False,
+                settings=True,       # RestorePreserveSettings: keep the phone's current settings
+                remove=False,        # RemoveItemsNotRestored off: every other app stays as it is
+                password=password or "",
+                source=udid,
+                skip_apps=True,      # don't reinstall apps
+                progress_callback=progress,
+            )
+
+    asyncio.run(run())

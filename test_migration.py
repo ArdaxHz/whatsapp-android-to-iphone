@@ -103,6 +103,7 @@ def make_backup(root: Path, ios_dir: Path, password: str | None) -> Path:
     m.execute("CREATE TABLE Files (fileID TEXT PRIMARY KEY, domain TEXT, relativePath TEXT, flags INT, file BLOB)")
     dir_rec = {"$top": {"root": plistlib.UID(1)}, "$objects": ["$null", {"Mode": 0o40755, "Size": 0, "RelativePath": plistlib.UID(2)}, "Message"]}
     m.execute("INSERT INTO Files VALUES (?,?,?,2,?)", (file_id("Message"), WA_DOMAIN, "Message", plistlib.dumps(dir_rec, fmt=plistlib.FMT_BINARY)))
+    m.execute("INSERT INTO Files VALUES ('other','HomeDomain','Library',2,?)", (plistlib.dumps(dir_rec, fmt=plistlib.FMT_BINARY),))
     for suffix in ("", "-wal", "-shm"):
         data = (ios_dir / (CHATSTORAGE + suffix)).read_bytes()
         fid = file_id(CHATSTORAGE + suffix)
@@ -148,6 +149,17 @@ def run(t: Path, password: str | None):
     assert stats == {"chats_new": 1, "chats_merged": 1, "messages": 5, "skipped_dupes": 0}, stats
     assert len(media) == 1 and media[0][1].startswith(f"Message/Media/{BOB}/"), media
     write_back(backup, db, media, safe)
+
+    # WhatsApp-only backup: just WhatsApp's files, same keys, empty WAL so the phone's live one is replaced.
+    slim_root = backup.export_whatsapp_only(t / "slim")
+    slim = Backup(slim_root / path.name, t / "slim_manifest", password)
+    assert {d for (d,) in slim.db.execute("SELECT DISTINCT domain FROM Files")} == {WA_DOMAIN}
+    (t / "s").mkdir()
+    slim.extract(CHATSTORAGE, t / "s" / "c.sqlite")
+    slim.extract(media[0][1], t / "s" / "photo")
+    slim.extract(CHATSTORAGE + "-wal", t / "s" / "wal")
+    assert (t / "s" / "photo").read_bytes() == PHOTO and (t / "s" / "wal").stat().st_size == 0
+    assert (t / "s" / "c.sqlite").read_bytes() == db.read_bytes()
 
     # Re-open from disk like Finder would, and read everything back.
     check = Backup(path, t / "check_manifest", password)

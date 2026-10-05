@@ -4,10 +4,15 @@ Merges Android WhatsApp history (msgstore.db) into the iPhone's own ChatStorage.
 The iOS file is a Core Data store whose schema changes between WhatsApp versions, so we
 never create it — we insert rows into the real one taken from the iPhone backup, filling
 only columns that exist. Field choices follow watoi (github.com/residentsummer/watoi),
-which is known to produce databases WhatsApp accepts. Media messages become text
-placeholders ("[Photo: IMG-…jpg] caption"); the files themselves are kept on the Mac.
+which is known to produce databases WhatsApp accepts.
+
+Media: when the Android file was pulled, the message becomes a real iOS media message
+(WAMediaItem + file at Message/Media/<chat>/<x>/<y>/<uuid>.<ext>) and merge() returns the
+files to copy into the backup. Missing files fall back to a "[Photo: …] caption" text.
 """
+import mimetypes
 import sqlite3
+import uuid
 from pathlib import Path
 from rich.console import Console
 
@@ -21,6 +26,18 @@ PLACEHOLDERS = {
     9: "Document", 13: "GIF", 16: "Live location", 20: "Sticker",
     42: "View-once photo", 43: "View-once video",
 }
+
+
+# Android message_type → iOS ZMESSAGETYPE for media we can carry over as files.
+IOS_MEDIA_TYPES = {1: 1, 3: 2, 13: 2, 2: 3, 9: 8, 20: 15}  # image, video, gif→video, audio, document, sticker
+
+
+def find_media(media_root: Path | None, file_path: str | None) -> Path | None:
+    """Android paths look like "Media/WhatsApp Images/IMG-….jpg" (or absolute on old versions)."""
+    if not media_root or not file_path or "Media/" not in file_path:
+        return None
+    local = media_root / file_path.split("Media/", 1)[1]
+    return local if local.is_file() else None
 
 
 def android_ts_to_apple(ts_ms) -> float | None:
@@ -87,8 +104,9 @@ def _android_chats(a: sqlite3.Connection):
     return jids, chats
 
 
-def merge(android_db: Path, ios_db: Path) -> dict:
-    """Merges android_db into ios_db in place. Re-running is safe: already-imported messages are skipped."""
+def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dict:
+    """Merges android_db into ios_db in place. Re-running is safe: already-imported messages are skipped.
+    Returns stats; stats["media"] lists (local file, backup relativePath) pairs to copy into the backup."""
     a = sqlite3.connect(android_db)
     a.row_factory = sqlite3.Row
     i = sqlite3.connect(ios_db)
@@ -99,7 +117,8 @@ def merge(android_db: Path, ios_db: Path) -> dict:
 
     jids, chats = _android_chats(a)
     sessions = {jid: pk for pk, jid in i.execute("SELECT Z_PK, ZCONTACTJID FROM ZWACHATSESSION")}
-    stats = {"chats_new": 0, "chats_merged": 0, "messages": 0, "skipped_dupes": 0}
+    stats = {"chats_new": 0, "chats_merged": 0, "messages": 0, "skipped_dupes": 0, "media": []}
+    has_media_item = "WAMediaItem" in store.ents
 
     console.print(f"  → {len(chats)} Android chats")
     for chat in chats:
@@ -138,7 +157,7 @@ def merge(android_db: Path, ios_db: Path) -> dict:
 
         rows = a.execute(
             """SELECT m.key_id, m.from_me, m.timestamp, m.message_type, m.text_data, m.starred,
-                      m.sender_jid_row_id, mm.file_path
+                      m.sender_jid_row_id, mm.*
                FROM message m LEFT JOIN message_media mm ON mm.message_row_id = m._id
                WHERE m.chat_row_id = ? ORDER BY m.timestamp, m._id""",
             (chat["_id"],),
@@ -178,7 +197,25 @@ def merge(android_db: Path, ios_db: Path) -> dict:
                             "ZISADMIN": 0,
                         })
                     values["ZGROUPMEMBER"] = members[sender]
-            store.insert("WAMessage", values)
+            src = find_media(media_root, m["file_path"]) if has_media_item else None
+            if src and m["message_type"] in IOS_MEDIA_TYPES:
+                values["ZMESSAGETYPE"] = IOS_MEDIA_TYPES[m["message_type"]]
+                values["ZTEXT"] = None
+            msg_pk = store.insert("WAMessage", values)
+            if src and m["message_type"] in IOS_MEDIA_TYPES:
+                u = str(uuid.uuid4())
+                local_path = f"Media/{chat_jid}/{u[0]}/{u[1]}/{u}{src.suffix.lower()}"
+                keys = m.keys()
+                item = store.insert("WAMediaItem", {
+                    "ZMESSAGE": msg_pk,
+                    "ZMEDIALOCALPATH": local_path,
+                    "ZFILESIZE": src.stat().st_size,
+                    "ZTITLE": m["text_data"] or (src.name if m["message_type"] == 9 else None),
+                    "ZMOVIEDURATION": m["media_duration"] if "media_duration" in keys else None,
+                    "ZVCARDSTRING": (m["mime_type"] if "mime_type" in keys else None) or mimetypes.guess_type(src.name)[0],
+                })
+                i.execute("UPDATE ZWAMESSAGE SET ZMEDIAITEM = ? WHERE Z_PK = ?", (item, msg_pk))
+                stats["media"].append((src, "Message/" + local_path))
             existing_ids.add(m["key_id"])
             stats["messages"] += 1
 

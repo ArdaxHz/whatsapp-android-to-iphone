@@ -103,8 +103,8 @@ def step_decrypt(dirs: dict, pulled: dict) -> Path:
     sys.exit(1)
 
 
-def step_iphone(dirs: dict, android_db: Path):
-    from src.iphone import choose_backup, check_backup, save_originals, extract_chatstorage, write_back, guide_restore
+def step_iphone(dirs: dict, android_db: Path, media_dir: Path | None):
+    from src.iphone import choose_backup, open_backup, save_originals, extract_chatstorage, write_back, guide_restore
     from src.convert import merge
 
     console.print(Panel("[bold]STEP 3 — Merge into your iPhone backup[/bold]", style="blue"))
@@ -113,23 +113,25 @@ def step_iphone(dirs: dict, android_db: Path):
         "Then make a fresh local backup:\n"
         "  1. Connect the iPhone, tap [bold]Trust[/bold] if asked\n"
         "  2. Finder → select the iPhone → General → [bold]Back up all of the data on your iPhone to this Mac[/bold]\n"
-        "  3. Make sure [bold]Encrypt local backup[/bold] is unticked\n"
-        "  4. Click [bold]Back Up Now[/bold] and wait for it to finish\n"
+        "  3. Click [bold]Back Up Now[/bold] and wait for it to finish\n"
+        "  [dim](Encrypted or not both work — if encrypted you'll be asked for its password.)[/dim]\n"
     )
     if not Confirm.ask("Backup finished?", default=True):
         sys.exit(0)
 
-    backup = choose_backup()
-    if not backup or not check_backup(backup):
+    path = choose_backup()
+    backup = open_backup(path, dirs["ios"] / "manifest") if path else None
+    if not backup:
         sys.exit(1)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    rollback = save_originals(backup, dirs["root"] / "iphone_originals" / f"{backup.name}-{stamp}")
+    safe_dir = dirs["root"] / "iphone_originals" / f"{path.name}-{stamp}"
+    rollback = save_originals(path, safe_dir)
     console.print(f"[green]  ✓ Original backup files saved.[/green] Undo script: {rollback}")
 
     db = extract_chatstorage(backup, dirs["ios"])
     console.print("\n[bold]Merging chats...[/bold]")
-    stats = merge(android_db, db)
+    stats = merge(android_db, db, media_dir)
 
     import sqlite3
     with sqlite3.connect(db) as conn:
@@ -139,12 +141,12 @@ def step_iphone(dirs: dict, android_db: Path):
 
     console.print(
         f"[green]  ✓ {stats['messages']:,} messages imported[/green] "
-        f"({stats['chats_new']} new chats, {stats['chats_merged']} merged into existing, "
-        f"{stats['skipped_dupes']:,} already present)"
+        f"({len(stats['media']):,} with media; {stats['chats_new']} new chats, "
+        f"{stats['chats_merged']} merged into existing, {stats['skipped_dupes']:,} already present)"
     )
-    write_back(backup, db)
+    write_back(backup, db, stats["media"], safe_dir)
     console.print("[green]  ✓ iPhone backup updated[/green]")
-    guide_restore(rollback)
+    guide_restore(rollback, backup.encrypted)
 
 
 def main():
@@ -159,13 +161,7 @@ def main():
 
     pulled = step_android(dirs)
     android_db = step_decrypt(dirs, pulled)
-    step_iphone(dirs, android_db)
-
-    if pulled.get("media_dir"):
-        console.print(
-            f"\nPhotos/videos/voice notes from Android are in: [bold]{pulled['media_dir']}[/bold]\n"
-            "In chats they appear as placeholders like [Photo: IMG-…jpg] so you can find each file."
-        )
+    step_iphone(dirs, android_db, pulled.get("media_dir"))
 
 
 if __name__ == "__main__":

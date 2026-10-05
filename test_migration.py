@@ -150,17 +150,6 @@ def run(t: Path, password: str | None):
     assert len(media) == 1 and media[0][1].startswith(f"Message/Media/{BOB}/"), media
     write_back(backup, db, media, safe)
 
-    # WhatsApp-only backup: just WhatsApp's files, same keys, empty WAL so the phone's live one is replaced.
-    slim_root = backup.export_whatsapp_only(t / "slim")
-    slim = Backup(slim_root / path.name, t / "slim_manifest", password)
-    assert {d for (d,) in slim.db.execute("SELECT DISTINCT domain FROM Files")} == {WA_DOMAIN}
-    (t / "s").mkdir()
-    slim.extract(CHATSTORAGE, t / "s" / "c.sqlite")
-    slim.extract(media[0][1], t / "s" / "photo")
-    slim.extract(CHATSTORAGE + "-wal", t / "s" / "wal")
-    assert (t / "s" / "photo").read_bytes() == PHOTO and (t / "s" / "wal").stat().st_size == 0
-    assert (t / "s" / "c.sqlite").read_bytes() == db.read_bytes()
-
     # Re-open from disk like Finder would, and read everything back.
     check = Backup(path, t / "check_manifest", password)
     assert not check.has(CHATSTORAGE + "-wal") and check.has(CHATSTORAGE)

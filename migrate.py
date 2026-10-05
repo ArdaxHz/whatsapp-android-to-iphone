@@ -147,52 +147,9 @@ def step_iphone(dirs: dict, android_db: Path, media_dir: Path | None):
     )
     write_back(backup, db, stats["media"], safe_dir)
     console.print("[green]  ✓ iPhone backup updated[/green]")
-    step_restore(dirs, backup, path, rollback)
+    guide_restore(rollback, backup.encrypted)
 
 
-def step_restore(dirs: dict, backup, path: Path, rollback: Path):
-    from src.iphone import guide_restore, restore_whatsapp_only
-
-    console.print(Panel("[bold]STEP 4 — Put it on the iPhone[/bold]", style="blue"))
-    console.print(
-        "  [bold]1[/bold]. WhatsApp only [green](recommended)[/green] — restores just WhatsApp's chats and media.\n"
-        "     Other apps, logins, photos and settings are left exactly as they are.\n"
-        "  [bold]2[/bold]. Full restore in Finder — restores the whole iPhone from the backup.\n"
-    )
-    if Prompt.ask("Choose", choices=["1", "2"], default="1") == "2":
-        guide_restore(rollback, backup.encrypted)
-        return
-
-    console.print("\n[dim]Building WhatsApp-only backup...[/dim]")
-    slim_root = backup.export_whatsapp_only(dirs["root"] / "whatsapp_only_restore")
-    console.print(
-        "\nOn the iPhone, before continuing:\n"
-        "  1. Settings → [your name] → Find My → turn [bold]Find My iPhone OFF[/bold] (Apple requires this for any restore)\n"
-        "  2. Turn on [bold]Airplane Mode[/bold] (stops WhatsApp writing new messages mid-restore)\n"
-        "  3. Swipe WhatsApp away in the app switcher so it's fully closed\n"
-        "  4. Keep the iPhone unlocked and plugged in to this Mac\n"
-    )
-    if not Confirm.ask("Ready?", default=True):
-        console.print(f"Nothing sent to the iPhone. Run again any time; undo script: {rollback}")
-        return
-    try:
-        console.print("[bold]Restoring WhatsApp data...[/bold] (the iPhone shows 'Restore in Progress', then restarts)")
-        restore_whatsapp_only(slim_root, path.name, backup.password)
-    except Exception as e:
-        console.print(f"[red]WhatsApp-only restore failed:[/red] {e}")
-        console.print(
-            "Other apps aren't affected (this only ever sends WhatsApp files). If WhatsApp misbehaves now,\n"
-            "use the full Finder restore below — your backup already contains everything:"
-        )
-        guide_restore(rollback, backup.encrypted)
-        return
-    console.print(
-        "\n[green]✓ Done.[/green] When the iPhone has restarted:\n"
-        "  • Turn Airplane Mode off, open WhatsApp and check your chats\n"
-        "  • If WhatsApp offers an iCloud restore, tap [bold]Skip[/bold]\n"
-        "  • Turn Find My back on\n"
-        "[bold]Keep WhatsApp on Android untouched until you've checked everything.[/bold]"
-    )
 
 
 def main():

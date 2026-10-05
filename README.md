@@ -51,8 +51,7 @@ python3 migrate.py
 2. Click **Back Up Now** (encrypted or not — if encrypted, the tool asks for that backup password)
 3. The tool merges the chats into WhatsApp's database inside that backup.
 
-**4. Restore** — the tool asks which way:
-- **WhatsApp only (recommended):** the tool sends the iPhone a backup containing only WhatsApp's chats and media, with *remove items not restored* off, so other apps, logins, photos and settings stay as they are. Before it starts: turn off **Find My iPhone**, turn on **Airplane Mode**, swipe WhatsApp closed, keep the phone unlocked. The iPhone restarts when done. Not yet tried on a real phone; if it fails, use the full restore.
+**4. Restore** (a full Finder restore — partial "app-only" restores wiped the phone in testing, so they were removed):
 - **Full restore:** Finder → **Restore Backup…** → the backup you picked (Find My must be off).
 
 Afterwards open WhatsApp; verify your number if asked. If it offers an **iCloud** restore, tap **Skip** — that would replace the imported chats.

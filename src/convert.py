@@ -190,7 +190,7 @@ def merge(android_db: Path, ios_db: Path, media_root: Path | None = None) -> dic
                 "ZTEXT": text,
                 "ZSTANZAID": m["key_id"],
                 "ZSTARRED": int(bool(m["starred"])),
-                "ZDATAITEMVERSION": 2,
+                "ZDATAITEMVERSION": 3,
                 "ZMESSAGESTATUS": 5 if from_me else 0,
             }
             if from_me:
@@ -268,6 +268,15 @@ def _repair(i: sqlite3.Connection):
         for col in cols:
             if col in existing:
                 i.execute(f"UPDATE {table} SET {col} = 0 WHERE {col} IS NULL")
+    # Match what WhatsApp itself writes on every message (seen on all native rows of a real iPhone DB).
+    msg_cols = {r[1] for r in i.execute("PRAGMA table_info(ZWAMESSAGE)")}
+    for col, sql in (
+        ("ZDATAITEMVERSION", "UPDATE ZWAMESSAGE SET ZDATAITEMVERSION = 3 WHERE ZDATAITEMVERSION IS NULL OR ZDATAITEMVERSION < 3"),
+        ("ZFLAGS", "UPDATE ZWAMESSAGE SET ZFLAGS = ZFLAGS | 16777216 WHERE (ZFLAGS & 16777216) = 0"),
+        ("ZSPOTLIGHTSTATUS", "UPDATE ZWAMESSAGE SET ZSPOTLIGHTSTATUS = -32768 WHERE ZSPOTLIGHTSTATUS = 0"),
+    ):
+        if col in msg_cols:
+            i.execute(sql)
 
 
 def _resort_chats(i: sqlite3.Connection, sessions: set):

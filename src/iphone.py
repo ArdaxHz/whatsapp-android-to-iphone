@@ -153,17 +153,17 @@ class Backup:
     def blob(self, fid: str) -> Path:
         return self.path / fid[:2] / fid
 
-    def record(self, rel: str) -> dict | None:
-        row = self.db.execute("SELECT file FROM Files WHERE fileID = ?", (file_id(rel),)).fetchone()
+    def record(self, rel: str, domain: str = WA_DOMAIN) -> dict | None:
+        row = self.db.execute("SELECT file FROM Files WHERE fileID = ?", (file_id(rel, domain),)).fetchone()
         return plistlib.loads(row[0]) if row else None
 
-    def has(self, rel: str) -> bool:
-        return self.record(rel) is not None
+    def has(self, rel: str, domain: str = WA_DOMAIN) -> bool:
+        return self.record(rel, domain) is not None
 
-    def extract(self, rel: str, dest: Path):
-        rec = self.record(rel)
+    def extract(self, rel: str, dest: Path, domain: str = WA_DOMAIN):
+        rec = self.record(rel, domain)
         obj = rec["$objects"][rec["$top"]["root"].data]
-        src = self.blob(file_id(rel))
+        src = self.blob(file_id(rel, domain))
         if self.encrypted and "EncryptionKey" in obj:
             key = self.keybag.unwrap(rec["$objects"][obj["EncryptionKey"].data]["NS.data"])
             _decrypt_file(src, dest, key, obj["Size"])
@@ -329,6 +329,31 @@ def extract_chatstorage(backup: Backup, work_dir: Path) -> Path:
     conn.execute("PRAGMA journal_mode=DELETE")  # merges -wal into the main file
     conn.close()
     return db
+
+
+def read_contacts(backup: Backup, work_dir: Path) -> dict:
+    """phone_key → name from the iPhone's address book, used to show @mentions as names. Empty if absent."""
+    from src.convert import phone_key
+    rel, domain = "Library/AddressBook/AddressBook.sqlitedb", "HomeDomain"
+    if not backup.has(rel, domain):
+        return {}
+    dest = work_dir / "AddressBook.sqlitedb"
+    backup.extract(rel, dest, domain)
+    names = {}
+    ab = sqlite3.connect(dest)
+    try:
+        for first, last, org, number in ab.execute(
+                "SELECT p.First, p.Last, p.Organization, v.value FROM ABPerson p "
+                "JOIN ABMultiValue v ON v.record_id = p.ROWID WHERE v.property = 3"):
+            name = " ".join(x for x in (first, last) if x) or org
+            if name and number and phone_key(number):
+                names.setdefault(phone_key(number), name)
+    except sqlite3.DatabaseError:
+        pass  # unexpected schema: fall back to profile names / numbers
+    finally:
+        ab.close()
+        dest.unlink(missing_ok=True)
+    return names
 
 
 def write_back(backup: Backup, new_db: Path, media: list, safe_dir: Path):

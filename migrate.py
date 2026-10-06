@@ -105,7 +105,8 @@ def step_decrypt(dirs: dict, pulled: dict) -> Path:
 
 
 def step_iphone(dirs: dict, android_db: Path, media_dir: Path | None):
-    from src.iphone import choose_backup, open_backup, save_originals, extract_chatstorage, write_back, guide_restore
+    from src.iphone import (choose_backup, open_backup, save_originals, extract_chatstorage, read_contacts,
+                            write_back, guide_restore)
     from src.convert import merge
 
     console.print(Panel("[bold]STEP 3 — Merge into your iPhone backup[/bold]", style="blue"))
@@ -132,7 +133,9 @@ def step_iphone(dirs: dict, android_db: Path, media_dir: Path | None):
 
     db = extract_chatstorage(backup, dirs["ios"])
     console.print("\n[bold]Merging chats...[/bold]")
-    stats = merge(android_db, db, media_dir)
+    contacts = read_contacts(backup, dirs["ios"])
+    console.print(f"  [dim]{len(contacts):,} phone numbers from your iPhone contacts (used for @mention names)[/dim]")
+    stats = merge(android_db, db, media_dir, contacts)
 
     import sqlite3
     with sqlite3.connect(db) as conn:
@@ -143,7 +146,8 @@ def step_iphone(dirs: dict, android_db: Path, media_dir: Path | None):
     console.print(
         f"[green]  ✓ {stats['messages']:,} messages imported[/green] "
         f"({len(stats['media']):,} with media; {stats['chats_new']} new chats, "
-        f"{stats['chats_merged']} merged into existing, {stats['skipped_dupes']:,} already present)"
+        f"{stats['chats_merged']} merged into existing, {stats['skipped_dupes']:,} already present, "
+        f"{stats['refreshed']:,} of those updated)"
     )
     write_back(backup, db, stats["media"], safe_dir)
     console.print("[green]  ✓ iPhone backup updated[/green]")
@@ -172,6 +176,9 @@ def main():
 
     pulled = step_android(dirs)
     android_db = step_decrypt(dirs, pulled)
+    import shutil
+    shutil.copy2(android_db, pulled["archive"] / "msgstore-decrypted.db")
+    console.print(f"[green]  ✓ Android history saved permanently:[/green] {pulled['archive']}")
     step_iphone(dirs, android_db, pulled.get("media_dir"))
 
 

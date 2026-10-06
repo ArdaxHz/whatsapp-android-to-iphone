@@ -1,7 +1,9 @@
 """
 Android extraction via ADB — pulls WhatsApp backups and media. Read-only: nothing on the phone is changed.
 """
+import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from rich.console import Console
 
@@ -49,6 +51,37 @@ def _find_wa_root() -> str | None:
     return None
 
 
+RESTORE_NOTES = """\
+This folder is a permanent copy of your Android WhatsApp backup. Later runs never overwrite it.
+
+  - {name}: the encrypted backup, exactly as it was on the phone
+  - msgstore-decrypted.db: the same history decrypted (the migration tool re-runs from it, no key needed)
+  - photos/videos/voice notes: {media} (shared by all runs — don't delete it)
+
+To migrate again without the Android phone: copy msgstore-decrypted.db to
+  ~/WhatsApp-Migration/decrypted/msgstore.db
+and run migrate.py, answering Yes to "Reuse it".
+
+To put this history back on an Android phone (needs your 64-digit key):
+  1. Install WhatsApp on the Android phone but don't open it yet. Connect it with USB debugging on.
+  2. adb shell mkdir -p {wa_root}/Databases
+     adb push "{folder}/{name}" {wa_root}/Databases/msgstore.db.{ext}
+     adb push "{media}/." {wa_root}/Media/
+  3. Open WhatsApp, verify your number, tap Restore when offered the local backup,
+     and enter the 64-digit key. (If it offers a Google Drive backup instead, that one may be older.)
+"""
+
+
+def archive_backup(backup_file: Path, archive_root: Path, wa_root: str) -> Path:
+    """Copies the pulled backup to a dated folder that is never overwritten, with restore notes."""
+    archive = archive_root / datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    archive.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(backup_file, archive / backup_file.name)
+    (archive / "HOW-TO-RESTORE.txt").write_text(RESTORE_NOTES.format(
+        folder=archive, name=backup_file.name, ext=backup_file.name.rsplit(".", 1)[-1], media=backup_file.parent.parent / "media", wa_root=wa_root))
+    return archive
+
+
 def pull_whatsapp_files(output_dir: Path) -> dict:
     """Pulls the newest msgstore backup and the Media folder. Returns paths to pulled files."""
     result = {}
@@ -75,7 +108,8 @@ def pull_whatsapp_files(output_dir: Path) -> dict:
         console.print(f"[red]  ✗ Could not pull database: {pull.stderr.strip()}[/red]")
         return result
     result["backup_db"] = dest
-    console.print(f"[green]  ✓ Got backup:[/green] {dest.name}")
+    result["archive"] = archive_backup(dest, output_dir.parent / "android_backups", root)
+    console.print(f"[green]  ✓ Got backup:[/green] {dest.name} [dim](kept permanently in {result['archive']})[/dim]")
 
     console.print("\n[bold]Pulling WhatsApp media[/bold] (a copy is kept on your Mac; this may take a while)...")
     media_dir = output_dir / "media"

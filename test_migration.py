@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from src.convert import merge
+from src.convert import merge, phone_key
 from src.iphone import (CHATSTORAGE, WA_DOMAIN, Backup, _aes_unwrap, _aes_wrap, _cbc, _pad,
                         extract_chatstorage, file_id, save_originals, write_back)
 
@@ -24,7 +24,12 @@ def make_android(path: Path):
         CREATE TABLE message (_id INTEGER PRIMARY KEY, chat_row_id INT, from_me INT, key_id TEXT,
             sender_jid_row_id INT, timestamp INT, message_type INT, text_data TEXT, starred INT);
         CREATE TABLE message_media (message_row_id INT, chat_row_id INT, file_path TEXT, mime_type TEXT, media_duration INT);
-        INSERT INTO jid VALUES (1,'447700900001@s.whatsapp.net'),(2,'120363000@g.us'),(3,'447700900002@s.whatsapp.net'),(4,'status@broadcast'),(5,'447700900009@s.whatsapp.net');
+        CREATE TABLE jid_map (lid_row_id INT, jid_row_id INT);
+        CREATE TABLE message_mentions (message_row_id INT, jid_row_id INT, display_name TEXT);
+        INSERT INTO jid VALUES (1,'447700900001@s.whatsapp.net'),(2,'120363000@g.us'),(3,'447700900002@s.whatsapp.net'),(4,'status@broadcast'),(5,'447700900009@s.whatsapp.net'),
+                               (6,'98765432101234@lid');
+        INSERT INTO jid_map VALUES (6,1);
+        INSERT INTO message_mentions VALUES (8,6,NULL),(12,3,NULL);
         INSERT INTO chat VALUES (1,1,NULL,0,0),(2,2,'Family',0,1600000000000),(3,4,NULL,0,0),(4,5,NULL,0,0);
         INSERT INTO message VALUES
             (1,1,0,'K1',0,1600000001000,0,'hi from bob',0),
@@ -33,9 +38,15 @@ def make_android(path: Path):
             (4,1,0,'K4',0,1600000004000,7,NULL,0),
             (5,2,0,'K5',3,1600000005000,0,'group hello',0),
             (6,3,0,'K6',1,1600000006000,0,'status update',0),
-            (7,1,0,'K7',0,1600000007000,3,NULL,0);
+            (7,1,0,'K7',0,1600000007000,3,NULL,0),
+            (8,1,0,'K8',0,1600000008000,0,'thanks @98765432101234',0),
+            (9,1,0,'K9',0,1600000009000,81,NULL,0),
+            (10,1,0,'K10',0,1600000010000,99,NULL,0),
+            (11,1,0,'K11',0,1600000011000,55,'odd type with text',0),
+            (12,2,0,'K12',3,1600000012000,0,'hey @447700900002',0);
         INSERT INTO message_media VALUES (3,1,'Media/WhatsApp Images/IMG-1.jpg','image/jpeg',0),
-                                         (7,1,'Media/WhatsApp Video/gone.mp4','video/mp4',9);
+                                         (7,1,'Media/WhatsApp Video/gone.mp4','video/mp4',9),
+                                         (9,1,'Media/WhatsApp Video Notes/PTV-1.mp4','video/mp4',3);
     """)
     a.commit()
     a.close()
@@ -133,6 +144,8 @@ def run(t: Path, password: str | None):
     media_root = t / "media"
     (media_root / "WhatsApp Images").mkdir(parents=True)
     (media_root / "WhatsApp Images" / "IMG-1.jpg").write_bytes(PHOTO)
+    (media_root / "WhatsApp Video Notes").mkdir()
+    (media_root / "WhatsApp Video Notes" / "PTV-1.mp4").write_bytes(b"ptv")
     (t / "ios").mkdir()
     live = make_ios(t / "ios" / CHATSTORAGE)
     path = make_backup(t, t / "ios", password)
@@ -144,10 +157,10 @@ def run(t: Path, password: str | None):
     backup = Backup(path, t / "work_manifest", password)
     assert backup.encrypted == bool(password)
     db = extract_chatstorage(backup, t / "work")
-    stats = merge(android, db, media_root)
+    stats = merge(android, db, media_root, {phone_key(BOB): "Bob Smith"})
     media = stats.pop("media")
-    assert stats == {"chats_new": 1, "chats_merged": 1, "messages": 5, "skipped_dupes": 0}, stats
-    assert len(media) == 1 and media[0][1].startswith(f"Message/Media/{BOB}/"), media
+    assert stats == {"chats_new": 1, "chats_merged": 1, "messages": 9, "skipped_dupes": 0, "refreshed": 0}, stats
+    assert len(media) == 2 and all(m[1].startswith(f"Message/Media/{BOB}/") for m in media), media
     write_back(backup, db, media, safe)
 
     # Re-open from disk like Finder would, and read everything back.
@@ -166,23 +179,38 @@ def run(t: Path, password: str | None):
     assert i.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     bob = i.execute("SELECT ZTEXT, ZISFROMME, ZMESSAGETYPE, ZTOJID FROM ZWAMESSAGE WHERE ZCHATSESSION=1 ORDER BY ZSORT").fetchall()
     assert bob == [("hi from bob", 0, 0, None), ("hi back", 1, 0, BOB), (None, 0, 1, None),
-                   ("[Video: gone.mp4]", 0, 0, None), ("new on iphone", 0, 0, None)], bob
+                   ("[Video: gone.mp4]", 0, 0, None), ("thanks @Bob Smith", 0, 0, None), (None, 0, 2, None),
+                   ("odd type with text", 0, 0, None), ("new on iphone", 0, 0, None)], bob
+    # No address-book name for Alice: shown as a phone number rather than a bare id.
+    assert i.execute("SELECT ZTEXT FROM ZWAMESSAGE WHERE ZSTANZAID='K12'").fetchone() == ("hey @+447700900002",)
     item = i.execute("SELECT mi.ZMEDIALOCALPATH, mi.ZTITLE, mi.ZFILESIZE, mi.ZVCARDSTRING FROM ZWAMESSAGE m "
-                     "JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM AND mi.ZMESSAGE = m.Z_PK").fetchone()
+                     "JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM AND mi.ZMESSAGE = m.Z_PK WHERE m.ZSTANZAID='K3'").fetchone()
     assert item == (media[0][1][len("Message/"):], "look", len(PHOTO), "image/jpeg"), item
     grp = i.execute("SELECT ZPARTNERNAME, ZSESSIONTYPE, ZGROUPINFO FROM ZWACHATSESSION WHERE ZCONTACTJID=?", (GROUP,)).fetchone()
     assert grp[:2] == ("Family", 1) and grp[2], grp
     # Visible in WhatsApp's chat list, and no empty chat for the contact with no messages.
     assert i.execute("SELECT COUNT(*) FROM ZWACHATSESSION WHERE ZHIDDEN IS NOT 0 OR ZREMOVED IS NOT 0").fetchone()[0] == 0
     assert i.execute("SELECT COUNT(*) FROM ZWACHATSESSION WHERE ZCONTACTJID = '447700900009@s.whatsapp.net'").fetchone()[0] == 0
-    assert i.execute("SELECT g.ZMEMBERJID FROM ZWAMESSAGE m JOIN ZWAGROUPMEMBER g ON g.Z_PK=m.ZGROUPMEMBER").fetchall() == [(ALICE,)]
+    assert i.execute("SELECT g.ZMEMBERJID FROM ZWAMESSAGE m JOIN ZWAGROUPMEMBER g ON g.Z_PK=m.ZGROUPMEMBER").fetchall() == [(ALICE,)] * 2
     for name, mx in i.execute("SELECT Z_NAME, Z_MAX FROM Z_PRIMARYKEY").fetchall():
         assert mx >= (i.execute(f"SELECT MAX(Z_PK) FROM Z{name.upper()}").fetchone()[0] or 0), name
     i.close()
 
-    # Re-running imports nothing twice.
-    again = merge(android, extract_chatstorage(check, t / "work2"), media_root)
-    assert again["messages"] == 0 and again["media"] == []
+    # Re-running imports nothing twice, and brings rows written by older versions up to date.
+    old = extract_chatstorage(check, t / "work2")
+    with sqlite3.connect(old) as o:
+        o.execute("UPDATE ZWAMESSAGE SET ZTEXT='thanks @98765432101234' WHERE ZSTANZAID='K8'")
+        o.execute("DELETE FROM ZWAMEDIAITEM WHERE ZMESSAGE=(SELECT Z_PK FROM ZWAMESSAGE WHERE ZSTANZAID='K9')")
+        o.execute("UPDATE ZWAMESSAGE SET ZMESSAGETYPE=0, ZMEDIAITEM=NULL, ZTEXT='[Message: PTV-1.mp4]' WHERE ZSTANZAID='K9'")
+        o.execute("INSERT INTO ZWAMESSAGE (Z_PK,Z_ENT,Z_OPT,ZCHATSESSION,ZMESSAGETYPE,ZTEXT,ZSTANZAID) VALUES (99,2,1,1,0,'[Message]','K10')")
+    again = merge(android, old, media_root, {phone_key(BOB): "Bob Smith"})
+    assert again["messages"] == 0 and again["refreshed"] == 3 and len(again["media"]) == 1, again
+    with sqlite3.connect(old) as o:
+        rows = dict(o.execute("SELECT ZSTANZAID, ZTEXT FROM ZWAMESSAGE WHERE ZSTANZAID IN ('K8','K9','K10')").fetchall())
+        assert rows == {"K8": "thanks @Bob Smith", "K9": None}, rows
+        assert o.execute("SELECT m.ZMESSAGETYPE FROM ZWAMESSAGE m JOIN ZWAMEDIAITEM mi ON mi.Z_PK=m.ZMEDIAITEM "
+                         "WHERE m.ZSTANZAID='K9'").fetchone() == (2,)
+    assert merge(android, old, media_root, {phone_key(BOB): "Bob Smith"})["refreshed"] == 0
 
     # Rollback restores the original manifest and removes added files.
     subprocess.run(["bash", str(rollback)], check=True, capture_output=True)

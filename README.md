@@ -65,6 +65,11 @@ Afterwards open WhatsApp; verify your number if asked. If it offers an **iCloud*
 - **Wrong iPhone backup password**: it is the password you set in Finder for *Encrypt local backup*, not your Apple ID.
 - **WhatsApp database not in backup**: open WhatsApp on the iPhone once (registered), then back up again.
 - **Undo before restoring**: `bash ~/WhatsApp-Migration/iphone_originals/<backup>-<time>/rollback.sh`
+- **Lost the Android phone / want to go back to Android**: every run keeps the Android backup in
+  `~/WhatsApp-Migration/android_backups/<date>/` (encrypted + decrypted). `HOW-TO-RESTORE.txt` in that folder explains
+  re-migrating from it or restoring it onto an Android phone. Keep `~/WhatsApp-Migration/android_data/media` too.
+- **Fixing an earlier import** (`[Message]` placeholders, `[Video message]` instead of video notes, mentions shown as
+  numbers): back up the iPhone again and rerun. Messages imported before are updated in place, not duplicated.
 
 ---
 

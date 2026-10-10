@@ -225,6 +225,19 @@ def main():
     wrapped = bytes.fromhex("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5")
     assert _aes_wrap(kek, key) == wrapped and _aes_unwrap(kek, wrapped) == key
 
+    # When an Android is connected, pull_whatsapp_files keeps a permanent local copy
+    # of the backup db. Guard that archive step (dated folder, copy, restore notes render).
+    with tempfile.TemporaryDirectory() as t:
+        from src.android import archive_backup
+        t = Path(t)
+        db = t / "msgstore.db.crypt15"
+        db.write_bytes(b"encrypted backup bytes")
+        archive = archive_backup(db, t / "android_backups", "/sdcard/WhatsApp")
+        assert archive.parent == t / "android_backups" and archive.exists()
+        assert (archive / db.name).read_bytes() == db.read_bytes()
+        notes = (archive / "HOW-TO-RESTORE.txt").read_text()
+        assert db.name in notes and "/sdcard/WhatsApp" in notes and "{" not in notes
+
     for password in (None, PASSWORD):
         with tempfile.TemporaryDirectory() as t:
             run(Path(t), password)

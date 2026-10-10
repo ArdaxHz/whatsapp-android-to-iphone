@@ -134,7 +134,12 @@ def step_iphone(dirs: dict, android_db: Path, media_dir: Path | None):
     db = extract_chatstorage(backup, dirs["ios"])
     console.print("\n[bold]Merging chats...[/bold]")
     contacts = read_contacts(backup, dirs["ios"])
-    console.print(f"  [dim]{len(contacts):,} phone numbers from your iPhone contacts (used for @mention names)[/dim]")
+    from src.convert import load_vcards
+    for vcf in sorted(dirs["root"].glob("*.vcf")):
+        extra = load_vcards(vcf)
+        contacts.update(extra)
+        console.print(f"  [dim]+{len(extra):,} names from {vcf.name}[/dim]")
+    console.print(f"  [dim]{len(contacts):,} phone numbers for @mention names (iPhone contacts + any .vcf)[/dim]")
     stats = merge(android_db, db, media_dir, contacts)
 
     import sqlite3

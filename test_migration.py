@@ -219,11 +219,29 @@ def run(t: Path, password: str | None):
     assert not (path / added_fid[:2] / added_fid).exists()
 
 
+def test_vcards(t: Path):
+    from src.convert import load_vcards, phone_key
+    vcf = t / "c.vcf"
+    vcf.write_text(
+        "BEGIN:VCARD\nFN:John Smith\nTEL;TYPE=CELL:+44 7799 979366\nEND:VCARD\n"
+        "BEGIN:VCARD\nFN:Aisha Khan\nitem1.TEL:07580 078302\nEND:VCARD\n"      # 0-prefixed local number
+        "BEGIN:VCARD\nFN:Folded Name\nTEL:+447886\n 297775\nEND:VCARD\n"        # RFC-6350 folded line
+        "BEGIN:VCARD\nFN:No Phone\nEND:VCARD\n")
+    m = load_vcards(vcf)
+    assert m[phone_key("447799979366@s.whatsapp.net")] == "John Smith"
+    assert m[phone_key("447580078302@s.whatsapp.net")] == "Aisha Khan"
+    assert m[phone_key("447886297775@s.whatsapp.net")] == "Folded Name"
+    assert len(m) == 3  # contact with no phone is skipped
+
+
 def main():
     # RFC 3394 §4.1 test vector.
     kek, key = bytes(range(16)), bytes.fromhex("00112233445566778899AABBCCDDEEFF")
     wrapped = bytes.fromhex("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5")
     assert _aes_wrap(kek, key) == wrapped and _aes_unwrap(kek, wrapped) == key
+
+    with tempfile.TemporaryDirectory() as t:
+        test_vcards(Path(t))
 
     for password in (None, PASSWORD):
         with tempfile.TemporaryDirectory() as t:

@@ -120,6 +120,26 @@ def phone_key(number: str) -> str:
     return digits[-9:] if len(digits) >= 9 else ""
 
 
+def load_vcards(path: Path) -> dict:
+    """phone_key → name from a vCard (.vcf) export, e.g. Google Contacts. Used when the iPhone's own
+    address book is empty (contacts synced from a Google/Exchange account live off-device)."""
+    text = path.read_text(errors="ignore").replace("\r\n", "\n")
+    text = text.replace("\n ", "").replace("\n\t", "")  # unfold RFC-6350 folded lines
+    names, fn = {}, None
+    for line in text.split("\n"):
+        key, _, value = line.partition(":")
+        key = key.split(";")[0].upper()  # drop params; "item1.TEL" → "item1.tel"
+        if key == "FN":
+            fn = value.strip() or None
+        elif key.endswith("TEL") and fn:
+            k = phone_key(value)
+            if k:
+                names[k] = fn  # last name wins; vCards list FN before its TELs
+        elif line.startswith("END:VCARD"):
+            fn = None
+    return names
+
+
 def _mention_names(a: sqlite3.Connection, jids: dict, contacts: dict) -> dict:
     """message _id → [("@<number>", "@<name>")]. Android writes mentions as raw numbers (or @lid ids)
     in the text; iOS can't resolve them without its own metadata, so we write the name in."""
